@@ -26,6 +26,4 @@ function _sudo {
 }
 set-alias  -name sudo -value _sudo
 
-#Get-PSReadLineOption | find /N " " | findstr /r \[[0-9]\]
-#(Get-PSReadLineOption | find /N " " | findstr /r \[[0-9]\]) | Select-Object -Index 3
 Write-Output "HistorySavePath is $((Get-PSReadLineOption).HistorySavePath)"
