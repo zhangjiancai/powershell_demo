@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    PowerShell 7 个人配置文件（稳定版 v1.0.0）
+    PowerShell 7 个人配置文件（稳定版 v1.1.0）
 
 .DESCRIPTION
     设计原则
@@ -18,7 +18,7 @@
 
 .NOTES
     文件：$PROFILE
-    仓库：D:\<用户名>\Documents\PowerShell（git 管理，稳定版对应 tag v1.0.0）
+    仓库：D:\<用户名>\Documents\PowerShell（git 管理，稳定版对应 tag v1.1.0）
 #>
 
 & {
@@ -195,19 +195,12 @@
     }
 
     # 本地 AI 预测插件（可选：文件不存在或加载失败都只是跳过）
+    # 模块导入时会自行完成：编译/加载 C# 预测器 → 注册到引擎 → 绑定 Alt+P 快捷键
     if ($IsConsole -and (Test-Path -LiteralPath $AiPredictorModule -PathType Leaf)) {
         try {
-            # AIPredictor 依赖 PSReadLine ≥ 2.2 的插件 API，需要时升级到本机最新版
-            $psrlLoaded = Get-Module PSReadLine
-            $psrlLatest = Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-            if ($psrlLoaded -and $psrlLatest -and $psrlLatest.Version -gt $psrlLoaded.Version) {
-                Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue
-                Import-Module PSReadLine -RequiredVersion $psrlLatest.Version -Force -ErrorAction Stop
-            }
-
             Import-Module -Name $AiPredictorModule -Force -ErrorAction Stop
             $aiLoaded = $true
-            Add-Summary '模块 AIPredictor（本地 AI 预测）'
+            Add-Summary '模块 AIPredictor（AI 预测：行内建议 + Alt+P 快捷键）'
         }
         catch {
             Write-Warning "AIPredictor 加载失败：$($_.Exception.Message)"
@@ -243,48 +236,11 @@
     }
 
     # ============================================================
-    # 6. AIPredictor 延迟注册：第一次显示提示符时再注册
-    #    （PSReadLine 插件只能在交互式控制台里注册，启动阶段还不满足条件）
-    # ============================================================
-    if ($aiLoaded -and (Get-Command Register-AIPredictor -ErrorAction SilentlyContinue)) {
-        $global:__ProfileOriginalPrompt = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
-        $global:__ProfileAiRegistered   = $false
-
-        function global:prompt {
-            if (-not $global:__ProfileAiRegistered) {
-                $global:__ProfileAiRegistered = $true   # 只尝试一次，失败也不会每次提示符都重试
-                try {
-                    # 模块内部用 Write-Error 报错、用全局标记表示成功，这里据实汇报，不谎报成功
-                    $registerOutput = Register-AIPredictor *>&1 | Out-String
-                    if (Get-Variable -Name __AIPredictor_Registered -Scope Global -ErrorAction SilentlyContinue) {
-                        Write-Host '✅ AIPredictor 已注册，可用自然语言触发 AI 预测' -ForegroundColor DarkGray
-                    }
-                    else {
-                        # 只取第一行原因，避免刷屏；要看完整输出可手动执行 Register-AIPredictor
-                        $reason = ($registerOutput -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-                        Write-Warning "AIPredictor 未能注册（不影响终端使用）：$reason"
-                    }
-                }
-                catch {
-                    Write-Warning "AIPredictor 注册异常（不影响终端使用）：$($_.Exception.Message)"
-                }
-            }
-
-            if ($global:__ProfileOriginalPrompt) {
-                & $global:__ProfileOriginalPrompt
-            }
-            else {
-                "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
-            }
-        }
-    }
-
-    # ============================================================
-    # 7. 启动汇总
+    # 6. 启动汇总
     # ============================================================
     if (-not $Quiet) {
         Write-Host ''
-        Write-Host '=== PowerShell 配置已加载（稳定版 v1.0.0）===' -ForegroundColor Cyan
+        Write-Host '=== PowerShell 配置已加载（稳定版 v1.1.0）===' -ForegroundColor Cyan
         foreach ($item in $Summary) {
             Write-Host "  $($item.Text)" -ForegroundColor $item.Color
         }

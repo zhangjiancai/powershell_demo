@@ -1,7 +1,13 @@
 # ===== 不入库（体积大 / 运行时生成 / 含敏感信息）=====
 
-# 模块目录（约 900 MB，含 Az.* 与 AIPredictor/config.json 里的 API Key）
-Modules/
+# 模块目录（约 900 MB）—— AIPredictor 是我们自己的代码，单独放行
+Modules/*
+!Modules/AIPredictor/
+
+# AIPredictor：config.json 含明文 API Key，编译产物与日志也不入库
+Modules/AIPredictor/config.json
+Modules/AIPredictor/bin/
+Modules/AIPredictor/*.log
 
 # Nerd Font 字体（约 280 MB）
 Meslo/
