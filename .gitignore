@@ -9,6 +9,23 @@ Modules/AIPredictor/config.json
 Modules/AIPredictor/bin/
 Modules/AIPredictor/*.log
 
+# ---- 敏感文件（防止误提交；用精确规则，避免误伤正常文件）----
+config.json
+*.key
+*.pem
+*.pfx
+*.p12
+*.ppk
+id_rsa*
+.env
+.env.*
+credentials.json
+secrets.json
+*credentials*.json
+*secrets*.json
+
+# 更全面的检查：Scripts/Test-NoSecrets.ps1（已装入 .git/hooks/pre-commit）
+
 # Nerd Font 字体（约 280 MB）
 Meslo/
 Meslo_LG_Nerd_Font/

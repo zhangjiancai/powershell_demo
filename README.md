@@ -176,6 +176,23 @@ Test-AIPredictor
 
 ---
 
+## 敏感信息保护
+
+仓库里**不含任何密钥**，并且有自动化兜底：
+
+- `Modules/AIPredictor/config.json`（含 API Key）被 `.gitignore` 排除，仓库里只有 `config.example.json` 模板；
+- `.gitignore` 另外排除 `*.key / *.pem / *.pfx / .env* / credentials.json / id_rsa*` 等常见敏感文件；
+- `Scripts/Test-NoSecrets.ps1` 扫描暂存区，命中疑似 Key / 令牌 / 私钥就阻止提交；
+
+  ```powershell
+  pwsh -File Scripts/Test-NoSecrets.ps1 -All                    # 手动全量检查
+  Copy-Item Scripts/hooks/pre-commit .git/hooks/pre-commit     # 安装 pre-commit 钩子
+  ```
+
+  误报可以 `git commit --no-verify` 跳过。
+
+---
+
 ## 版本与回退
 
 | tag | 内容 |

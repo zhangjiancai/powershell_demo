@@ -18,7 +18,7 @@
 
 .NOTES
     文件：$PROFILE
-    仓库：D:\<用户名>\Documents\PowerShell（git 管理，稳定版对应 tag v1.2.0）
+    仓库：本目录（git 管理，稳定版对应 tag v1.2.0）
 #>
 
 & {

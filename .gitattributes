@@ -2,3 +2,6 @@
 *.ps1  text eol=crlf
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
+
+# git 钩子是 shell 脚本，必须是 LF，否则 sh 会报 bad interpreter
+Scripts/hooks/* text eol=lf
