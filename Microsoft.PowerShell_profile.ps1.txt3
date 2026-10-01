@@ -1,0 +1,72 @@
+# 设置 oh-my-posh 的安装路径（无需添加到系统环境变量）
+$ohMyPoshPath = "D:\APP_LOW\oh-my-posh\bin\oh-my-posh.exe"
+
+# 检查 oh-my-posh.exe 是否存在于指定路径
+if (Test-Path $ohMyPoshPath) {
+    Write-Output "OhMyPosh 已安装"
+    Write-Output "安装位置：$ohMyPoshPath"
+} else {
+    Write-Output "错误：无法找到 OhMyPosh，请检查路径：$ohMyPoshPath"
+    exit
+}
+
+
+# 从注册表获取系统代理设置
+$proxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+# 检查是否启用了代理
+if ($proxySettings.ProxyEnable -eq 1 -and $proxySettings.ProxyServer) {
+    Write-Output "检测到系统代理已启用。"
+    Write-Output "当前系统代理地址: $($proxySettings.ProxyServer)"
+
+    # 将代理地址拆分为 URI
+    #$proxyUri = [System.Uri]::New("http://$($proxySettings.ProxyServer)")
+
+    # 设置 PowerShell 会话的代理
+    #[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($proxyUri)
+    #Write-Output "PowerShell 会话已成功配置代理。"
+
+    # 同步设置 HTTP_PROXY 和 HTTPS_PROXY 环境变量
+    $env:HTTP_PROXY = "http://$($proxySettings.ProxyServer)"
+    $env:HTTPS_PROXY = "https://$($proxySettings.ProxyServer)"
+    Write-Output "已设置环境变量 HTTP_PROXY: $env:HTTP_PROXY"
+    Write-Output "已设置环境变量 HTTPS_PROXY: $env:HTTPS_PROXY"
+} else {
+    Write-Error "系统未启用代理或代理地址未配置，请检查系统代理设置。"
+}
+
+# 显示当前环境变量
+Write-Output "当前 HTTP 代理: $env:HTTP_PROXY"
+Write-Output "当前 HTTPS 代理: $env:HTTPS_PROXY"
+
+# 自动主题切换
+$themeDir = "D:\APP_LOW\oh-my-posh\themes\"
+if (Test-Path $themeDir) {
+    $theme = Get-ChildItem $themeDir | Get-Random
+    Write-Output "hello! today's lucky theme is: $($theme.Name)"
+    & $ohMyPoshPath --init --shell pwsh --config $theme.FullName | Invoke-Expression
+} else {
+    Write-Output "错误：主题文件夹不存在：$themeDir"
+    exit
+}
+
+# 设置 PSReadLine 历史路径
+$historyPath = "D:\<用户名>\Documents\PowerShell\PSReadLine\ConsoleHost_history.txt"
+Set-PSReadLineOption -HistorySavePath $historyPath
+
+if (Test-Path $historyPath) {
+    Write-Output "HistorySavePath 已设置为：$historyPath"
+} else {
+    Write-Output "警告：无法访问历史文件路径：$historyPath"
+}
+
+# sudo 函数定义（以管理员身份运行 PowerShell 命令）
+#function _sudo {
+#    $ss = "$args ; pause"
+#    Start-Process powershell -Verb runAs -ArgumentList $ss -Wait
+#}
+#set-alias -name sudo -value _sudo
+
+# 导入所需模块
+Import-Module Az.Tools.Predictor
+#Import-Module -Name Microsoft.WinGet.CommandNotFound

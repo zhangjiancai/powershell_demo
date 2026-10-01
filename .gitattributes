@@ -1,0 +1,4 @@
+# PowerShell 脚本保持 CRLF，避免 Windows 下换行符来回变动
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf

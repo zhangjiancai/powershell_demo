@@ -1,0 +1,17 @@
+# ===== 不入库（体积大 / 运行时生成 / 含敏感信息）=====
+
+# 模块目录（约 900 MB，含 Az.* 与 AIPredictor/config.json 里的 API Key）
+Modules/
+
+# Nerd Font 字体（约 280 MB）
+Meslo/
+Meslo_LG_Nerd_Font/
+
+# Az.Tools.Predictor 运行时缓存
+AzPredictor/
+
+# 命令历史（可能包含敏感命令）
+PSReadLine/
+
+# 杂项
+*.log

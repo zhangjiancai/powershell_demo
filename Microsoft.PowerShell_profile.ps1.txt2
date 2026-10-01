@@ -1,0 +1,51 @@
+# 设置 oh-my-posh 的安装路径（无需添加到系统环境变量）
+$ohMyPoshPath = "D:\APP_LOW\oh-my-posh\bin\oh-my-posh.exe"
+
+# 检查 oh-my-posh.exe 是否存在于指定路径
+if (Test-Path $ohMyPoshPath) {
+    Write-Output "OhMyPosh 已安装"
+    Write-Output "安装位置：$ohMyPoshPath"
+} else {
+    Write-Output "错误：无法找到 OhMyPosh，请检查路径：$ohMyPoshPath"
+    exit
+}
+
+
+$proxy = "127.0.0.1:7897"
+$env:HTTP_PROXY = $proxy
+$env:HTTPS_PROXY = $proxy
+
+Write-Output "当前 HTTP 代理: $env:HTTP_PROXY"
+Write-Output "当前 HTTPS 代理: $env:HTTPS_PROXY"
+
+# 自动主题切换
+$themeDir = "D:\APP_LOW\oh-my-posh\themes\"
+if (Test-Path $themeDir) {
+    $theme = Get-ChildItem $themeDir | Get-Random
+    Write-Output "hello! today's lucky theme is: $($theme.Name)"
+    & $ohMyPoshPath --init --shell pwsh --config $theme.FullName | Invoke-Expression
+} else {
+    Write-Output "错误：主题文件夹不存在：$themeDir"
+    exit
+}
+
+# 设置 PSReadLine 历史路径
+$historyPath = "D:\<用户名>\Documents\PowerShell\PSReadLine\ConsoleHost_history.txt"
+Set-PSReadLineOption -HistorySavePath $historyPath
+
+if (Test-Path $historyPath) {
+    Write-Output "HistorySavePath 已设置为：$historyPath"
+} else {
+    Write-Output "警告：无法访问历史文件路径：$historyPath"
+}
+
+# sudo 函数定义（以管理员身份运行 PowerShell 命令）
+function _sudo {
+    $ss = "$args ; pause"
+    Start-Process powershell -Verb runAs -ArgumentList $ss -Wait
+}
+set-alias -name sudo -value _sudo
+
+# 导入所需模块
+Import-Module Az.Tools.Predictor
+Import-Module -Name Microsoft.WinGet.CommandNotFound
