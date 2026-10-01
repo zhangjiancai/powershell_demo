@@ -1,296 +1,293 @@
 <#
 .SYNOPSIS
-PowerShell 配置文件增强版
-- 更清晰的错误标识
-- 增强可读性
-- 模块化结构
+    PowerShell 7 个人配置文件（稳定版 v1.0.0）
+
+.DESCRIPTION
+    设计原则
+      1. 绝不 exit —— 任何一项配置失败都不会关闭你的终端窗口
+      2. 分块 try/catch —— oh-my-posh、代理、模块各自独立，互不影响
+      3. 只在交互式终端做交互的事 —— 管道 / 重定向 / CI 下自动跳过 PSReadLine、WinGet 等功能
+      4. 路径集中在配置区，并且都能用环境变量覆盖，不必改本文件
+
+    可用环境变量
+      POSH_PROFILE_QUIET=1               启动时只显示警告，不打印汇总
+      POSH_PROFILE_FORCE_INTERACTIVE=1   强制按交互式终端加载（排错用）
+      OHMYPOSH_EXE=<exe 路径>            覆盖 oh-my-posh 可执行文件位置
+      OHMYPOSH_THEMES=<目录>             覆盖主题目录
+      OHMYPOSH_THEME=<json 路径>         固定主题（不设置则每次随机）
+
+.NOTES
+    文件：$PROFILE
+    仓库：D:\<用户名>\Documents\PowerShell（git 管理，稳定版对应 tag v1.0.0）
 #>
 
-#region OhMyPosh 初始化
-try {
-    # 使用驼峰式变量命名
-    $OhMyPoshPath = "D:\APP_LOW\oh-my-posh\bin\oh-my-posh.exe"
+& {
+    $ErrorActionPreference = 'Continue'   # 单项出错只提示，不中断整个配置
 
-    if (-not (Test-Path -Path $OhMyPoshPath -PathType Leaf)) {
-        # 使用红色错误标识 + 问题路径标注
-        Write-Error "[!] OhMyPosh 未找到！问题路径：" 
-        Write-Host "    $OhMyPoshPath" -ForegroundColor Red
-        exit 1
+    # ============================================================
+    # 配置区
+    # ============================================================
+    $ProfileDir  = Split-Path -Parent $PROFILE
+    $Quiet       = $env:POSH_PROFILE_QUIET -eq '1'
+
+    $OhMyPoshExe = if ($env:OHMYPOSH_EXE)    { $env:OHMYPOSH_EXE }    else { 'D:\APP_LOW\oh-my-posh\bin\oh-my-posh.exe' }
+    $ThemeDir    = if ($env:OHMYPOSH_THEMES) { $env:OHMYPOSH_THEMES } else { 'D:\APP_LOW\oh-my-posh\themes' }
+    $PinnedTheme = $env:OHMYPOSH_THEME
+
+    $HistoryPath       = Join-Path $ProfileDir 'PSReadLine\ConsoleHost_history.txt'
+    $AiPredictorModule = Join-Path $ProfileDir 'Modules\AIPredictor\AIPredictor.psm1'
+
+    # 是否真正的交互式控制台（Windows Terminal / VS Code 终端都算；管道、重定向、CI 不算）
+    $IsConsole = $false
+    try {
+        $IsConsole = ($env:POSH_PROFILE_FORCE_INTERACTIVE -eq '1') -or (
+            $Host.Name -eq 'ConsoleHost' -and
+            -not [Console]::IsOutputRedirected -and
+            -not [Console]::IsInputRedirected
+        )
+    }
+    catch { $IsConsole = $false }
+
+    # 启动汇总：先收集，最后一次性打印
+    $Summary = [System.Collections.Generic.List[object]]::new()
+    function Add-Summary {
+        param([string]$Text, [string]$Color = 'DarkGray')
+        $Summary.Add([pscustomobject]@{ Text = $Text; Color = $Color })
     }
 
-    Write-Host "`n=== OhMyPosh 配置 ===" -ForegroundColor Cyan
-    Write-Host "已加载 OhMyPosh ($((Get-Item $OhMyPoshPath).VersionInfo.FileVersion))"
-}
-catch {
-    Write-Error "[初始化失败] OhMyPosh 配置异常：$_"
-    exit 2
-}
-#endregion
-
-#region 代理配置
-try {
-    Write-Host "`n=== 网络代理配置 ===" -ForegroundColor Cyan
-    
-    $proxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction Stop
-
-    if ($proxySettings.ProxyEnable -eq 1 -and $proxySettings.ProxyServer) {
-        $proxyAddress = $proxySettings.ProxyServer
-        
-        # 代理地址格式验证
-        if ($proxyAddress -notmatch '^[\w\.-]+:\d+$') {
-            Write-Error "[!] 代理地址格式错误："
-            Write-Host "    当前值: '$proxyAddress'" -ForegroundColor Red
-            Write-Host "    预期格式: 'host:port'" -ForegroundColor Yellow
-            exit 3
+    # ============================================================
+    # 1. oh-my-posh：定位程序 → 选主题 → 初始化提示符
+    # ============================================================
+    try {
+        if (-not (Test-Path -LiteralPath $OhMyPoshExe -PathType Leaf)) {
+            $onPath = Get-Command oh-my-posh -ErrorAction SilentlyContinue
+            if ($onPath) { $OhMyPoshExe = $onPath.Source }
         }
 
-        # 设置环境变量（黄色高亮关键操作）
-        Write-Host "系统代理已启用 → " -NoNewline
-        Write-Host $proxyAddress -ForegroundColor Yellow
-        
-        $env:HTTP_PROXY = "http://$proxyAddress"
-        $env:HTTPS_PROXY = "http://$proxyAddress"  # 保持协议统一
+        if (Test-Path -LiteralPath $OhMyPoshExe -PathType Leaf) {
+            $ompVersion = (Get-Item -LiteralPath $OhMyPoshExe).VersionInfo.FileVersion
 
-        # 凭据提示（如果检测到）
-        if ($proxySettings.ProxyUser) {
-            Write-Warning "检测到需要代理认证（用户名: $($proxySettings.ProxyUser)）"
-            Write-Warning "提示：请手动配置认证信息！"
+            $theme = $null
+            if ($PinnedTheme -and (Test-Path -LiteralPath $PinnedTheme -PathType Leaf)) {
+                $theme = Get-Item -LiteralPath $PinnedTheme
+            }
+            elseif (Test-Path -LiteralPath $ThemeDir) {
+                $themes = @(Get-ChildItem -LiteralPath $ThemeDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+                if ($themes.Count -gt 0) { $theme = $themes | Get-Random }
+            }
+
+            if ($theme) {
+                $initScript = & $OhMyPoshExe --init --shell pwsh --config $theme.FullName 2>$null | Out-String
+                if ($initScript.Trim()) {
+                    $initScript | Invoke-Expression
+                    Add-Summary "oh-my-posh $ompVersion · 主题 $($theme.Name)"
+                }
+                else {
+                    Add-Summary 'oh-my-posh 初始化没有输出，已跳过（提示符保持默认）' 'Yellow'
+                }
+            }
+            else {
+                Add-Summary "oh-my-posh $ompVersion · 没找到主题文件，提示符保持默认" 'Yellow'
+            }
+        }
+        else {
+            Add-Summary "oh-my-posh 未找到：$OhMyPoshExe（已跳过）" 'Yellow'
+        }
+    }
+    catch {
+        Add-Summary "oh-my-posh 初始化失败：$($_.Exception.Message)（已跳过）" 'Yellow'
+    }
+
+    # ============================================================
+    # 2. 系统代理 → 环境变量
+    # ============================================================
+    try {
+        $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+
+        if ($ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+            $rawProxy = [string]$ie.ProxyServer
+            $proxyAddress = $null
+
+            # 注册表可能是 "127.0.0.1:7897"，也可能是 "http=127.0.0.1:7897;https=127.0.0.1:7897"
+            foreach ($piece in ($rawProxy -split ';')) {
+                $part = $piece.Trim()
+                if ($part -match '^(?:[a-zA-Z]+=)?(?<addr>[^=\s]+:\d+)$') {
+                    $proxyAddress = $Matches['addr']
+                    break
+                }
+            }
+
+            if ($proxyAddress) {
+                $env:HTTP_PROXY  = "http://$proxyAddress"
+                $env:HTTPS_PROXY = "http://$proxyAddress"
+                Add-Summary "代理 $proxyAddress"
+            }
+            else {
+                Add-Summary "代理地址无法解析：$rawProxy（已跳过）" 'Yellow'
+            }
+
+            if ($ie.ProxyUser) {
+                Write-Warning "系统代理需要认证（用户名：$($ie.ProxyUser)），请自行配置凭据。"
+            }
+        }
+        else {
+            Add-Summary '代理 系统未启用（已跳过）'
+        }
+    }
+    catch {
+        Add-Summary "代理读取失败：$($_.Exception.Message)（已跳过）" 'Yellow'
+    }
+
+    # ============================================================
+    # 3. PSReadLine：命令历史文件位置
+    # ============================================================
+    $psrlReady = $false
+
+    if ($IsConsole) {
+        try {
+            if (-not (Get-Module PSReadLine)) { Import-Module PSReadLine -ErrorAction Stop }
+
+            $historyDir = Split-Path -Parent $HistoryPath
+            if (-not (Test-Path -LiteralPath $historyDir)) {
+                New-Item -ItemType Directory -Path $historyDir -Force | Out-Null
+            }
+
+            Set-PSReadLineOption -HistorySavePath $HistoryPath -ErrorAction Stop
+            $psrlReady = $true
+            Add-Summary "命令历史 $HistoryPath"
+        }
+        catch {
+            Add-Summary "命令历史配置失败：$($_.Exception.Message)" 'Yellow'
         }
     }
     else {
-        Write-Host "系统代理未启用" -ForegroundColor DarkGray
-    }
-}
-catch {
-    Write-Error "[代理配置失败] $_"
-    exit 4
-}
-#endregion
-
-#region 主题配置
-try {
-    Write-Host "`n=== 终端主题配置 ===" -ForegroundColor Cyan
-    
-    $themeDir = "D:\APP_LOW\oh-my-posh\themes"
-    $themeFiles = Get-ChildItem -Path $themeDir -Filter *.json -ErrorAction Stop
-
-    if ($themeFiles.Count -eq 0) {
-        Write-Error "[!] 未找到主题文件："
-        Write-Host "    目录: $themeDir" -ForegroundColor Red
-        exit 5
+        Add-Summary '命令历史 非交互式会话，已跳过 PSReadLine 配置'
     }
 
-    $randomTheme = $themeFiles | Get-Random
-    Write-Host "今日随机主题 → " -NoNewline
-    Write-Host $randomTheme.Name -ForegroundColor Magenta
+    # ============================================================
+    # 4. 模块加载
+    # ============================================================
+    $predictorLoaded = $false
+    $aiLoaded        = $false
 
-    # 初始化主题（绿色高亮关键操作）
-    & $OhMyPoshPath --init --shell pwsh --config $randomTheme.FullName | Invoke-Expression
-    Write-Host "主题已应用 √" -ForegroundColor Green
-}
-catch {
-    Write-Error "[主题配置失败] $_"
-    exit 6
-}
-#endregion
+    # Microsoft.WinGet.CommandNotFound 只在真正的控制台里加载：
+    # 它在非交互进程退出时会抛未处理异常（PowerToys 模块的已知问题）。
+    $modulesToLoad = @('Az.Tools.Predictor')
+    if ($IsConsole) { $modulesToLoad += 'Microsoft.WinGet.CommandNotFound' }
 
-#region 历史记录配置
-try {
-    Write-Host "`n=== 命令历史配置 ===" -ForegroundColor Cyan
-    
-    $historyPath = "D:\<用户名>\Documents\PowerShell\PSReadLine\ConsoleHost_history.txt"
-    $historyDir = Split-Path $historyPath -Parent
-
-    if (-not (Test-Path -Path $historyDir)) {
-        Write-Host "创建历史记录目录 → " -NoNewline
-        Write-Host $historyDir -ForegroundColor Yellow
-        New-Item -ItemType Directory -Path $historyDir -Force | Out-Null
-    }
-
-    Set-PSReadLineOption -HistorySavePath $historyPath
-    Write-Host "历史记录文件 → " -NoNewline
-    Write-Host $historyPath -ForegroundColor Cyan
-}
-catch {
-    Write-Error "[历史记录配置失败] $_"
-    exit 7
-}
-#endregion
-
-#region 模块加载
-try {
-    Write-Host "`n=== 模块加载 ===" -ForegroundColor Cyan
-
-    # 标准 PowerShellGallery 模块（可直接 Import-Module）
-    $galleryModules = @(
-        "Az.Tools.Predictor",
-        "Microsoft.WinGet.CommandNotFound"
-    )
-
-    foreach ($module in $galleryModules) {
-        $availableModules = Get-Module -Name $module -ListAvailable
-        
-        if (-not $availableModules) {
-            Write-Warning "[!] 模块未安装: $module"
-            Write-Host "    问题模块: $module" -ForegroundColor Red
-            continue
-        }
-
-        $latestModule = $availableModules | 
-                       Sort-Object { [version]$_.Version } -Descending | 
-                       Select-Object -First 1
-        
-        if (-not (Test-Path $latestModule.ModuleBase)) {
-            Write-Error "[!] 模块路径异常："
-            Write-Host "    模块名称: $module" -ForegroundColor Red
-            Write-Host "    异常路径: $($latestModule.ModuleBase)" -ForegroundColor Red
-            continue
-        }
-
-        Import-Module $module -ErrorAction Stop
-        Write-Host "已加载模块 → " -NoNewline
-        Write-Host $module -ForegroundColor Green -NoNewline
-        Write-Host " (v$($latestModule.Version))" -ForegroundColor DarkYellow
-        Write-Host "    安装路径: $($latestModule.ModuleBase)" -ForegroundColor DarkGray
-    }
-
-    # --- 处理 AIPredictor 插件 ---
-    $aiPredictorPath = Join-Path (Split-Path $PROFILE -Parent) "Modules\AIPredictor\AIPredictor.psm1"
-    if (Test-Path $aiPredictorPath) {
+    foreach ($moduleName in $modulesToLoad) {
         try {
-            # 1. 确保使用最新 PSReadLine
-            Remove-Module PSReadLine -ErrorAction SilentlyContinue
-            $latestPSRL = Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-            if ($latestPSRL) {
-                Import-Module PSReadLine -RequiredVersion $latestPSRL.Version -Force
-                Write-Host "已加载模块 → PSReadLine v$($latestPSRL.Version)" -ForegroundColor DarkGray
-            } else {
-                Write-Warning "[!] 未找到 PSReadLine 模块"
-                # 不 return，继续执行其他逻辑
+            $available = @(Get-Module -Name $moduleName -ListAvailable -ErrorAction SilentlyContinue)
+            if ($available.Count -eq 0) {
+                Write-Warning "模块未安装：$moduleName"
+                continue
             }
 
-            # 2. 加载 AIPredictor 模块
-            Import-Module $aiPredictorPath -Force -ErrorAction Stop
-            Write-Host "已加载本地插件 → " -NoNewline
-            Write-Host "AIPredictor" -ForegroundColor Green -NoNewline
-            Write-Host " (自定义 AI 预测)" -ForegroundColor DarkYellow
-            Write-Host "    路径: $aiPredictorPath" -ForegroundColor DarkGray
+            $latest = $available | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+            Import-Module -Name $moduleName -RequiredVersion $latest.Version -ErrorAction Stop
 
-            # 3. 检查 Register-AIPredictor 函数是否存在
-            if (-not (Get-Command Register-AIPredictor -ErrorAction SilentlyContinue)) {
-                Write-Warning "[!] AIPredictor 模块缺少 Register-AIPredictor 函数"
-                # 不 return，继续
-            } else {
-                # ========== 正确包装 Oh My Posh 的 prompt ==========
+            if ($moduleName -eq 'Az.Tools.Predictor') { $predictorLoaded = $true }
+            Add-Summary "模块 $moduleName v$($latest.Version)"
+        }
+        catch {
+            Write-Warning "模块加载失败：$moduleName —— $($_.Exception.Message)"
+        }
+    }
+
+    # 本地 AI 预测插件（可选：文件不存在或加载失败都只是跳过）
+    if ($IsConsole -and (Test-Path -LiteralPath $AiPredictorModule -PathType Leaf)) {
+        try {
+            # AIPredictor 依赖 PSReadLine ≥ 2.2 的插件 API，需要时升级到本机最新版
+            $psrlLoaded = Get-Module PSReadLine
+            $psrlLatest = Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+            if ($psrlLoaded -and $psrlLatest -and $psrlLatest.Version -gt $psrlLoaded.Version) {
+                Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue
+                Import-Module PSReadLine -RequiredVersion $psrlLatest.Version -Force -ErrorAction Stop
+            }
+
+            Import-Module -Name $AiPredictorModule -Force -ErrorAction Stop
+            $aiLoaded = $true
+            Add-Summary '模块 AIPredictor（本地 AI 预测）'
+        }
+        catch {
+            Write-Warning "AIPredictor 加载失败：$($_.Exception.Message)"
+        }
+    }
+
+    # ============================================================
+    # 5. PSReadLine 预测与快捷键（仅交互式终端）
+    # ============================================================
+    if ($psrlReady) {
+        try {
+            $predictionSource = if ($predictorLoaded -or $aiLoaded) { 'HistoryAndPlugin' } else { 'History' }
+            Set-PSReadLineOption -PredictionSource $predictionSource -ErrorAction Stop
+            Set-PSReadLineOption -MaximumHistoryCount 100000 -ErrorAction Stop
+            Set-PSReadLineOption -PredictionViewStyle InlineView -ErrorAction Stop
+            Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete -ErrorAction Stop
+
+            if ($predictorLoaded -or $aiLoaded) {
+                $pluginNames = @()
+                if ($predictorLoaded) { $pluginNames += 'Az.Tools.Predictor' }
+                if ($aiLoaded)        { $pluginNames += 'AIPredictor' }
+                Add-Summary "智能预测 $predictionSource（$($pluginNames -join ' + ')）"
+            }
+            else {
+                Add-Summary "智能预测 $predictionSource（未检测到预测插件）" 'Yellow'
+            }
+        }
+        catch {
+            # 预测功能不可用时退回历史记录预测，绝不影响终端正常使用
+            try { Set-PSReadLineOption -PredictionSource History -ErrorAction SilentlyContinue } catch { }
+            Add-Summary "智能预测不可用：$($_.Exception.Message)" 'Yellow'
+        }
+    }
+
+    # ============================================================
+    # 6. AIPredictor 延迟注册：第一次显示提示符时再注册
+    #    （PSReadLine 插件只能在交互式控制台里注册，启动阶段还不满足条件）
+    # ============================================================
+    if ($aiLoaded -and (Get-Command Register-AIPredictor -ErrorAction SilentlyContinue)) {
+        $global:__ProfileOriginalPrompt = (Get-Command prompt -ErrorAction SilentlyContinue).ScriptBlock
+        $global:__ProfileAiRegistered   = $false
+
+        function global:prompt {
+            if (-not $global:__ProfileAiRegistered) {
+                $global:__ProfileAiRegistered = $true   # 只尝试一次，失败也不会每次提示符都重试
                 try {
-                    # 获取原始 prompt 函数体（ScriptBlock）
-                    $originalPrompt = Get-Command prompt -ErrorAction Stop | Select-Object -ExpandProperty ScriptBlock
-
-                    # 定义新的包装 prompt 函数
-                    Set-Content function:\prompt {
-                        if ($null -eq (Get-Variable -Name __AIPredictor_Registered -Scope Global -ErrorAction SilentlyContinue)) {
-                            try {
-                                Register-AIPredictor *> $null
-                                if ($?) {
-                                    Write-Host "✅ AIPredictor 已成功注册" -ForegroundColor Green
-                                }
-                            } catch {
-                                Write-Warning "[!] 注册 AIPredictor 失败: $($_.Exception.Message)"
-                            }
-                            $global:__AIPredictor_Registered = $true
-                        }
-                        # 执行原始 Oh My Posh 提示符
-                        & $originalPrompt
-                    } -Force
-
-                    Write-Host "    ⏳ 将在首次显示提示符时自动注册 AIPredictor..." -ForegroundColor Yellow
+                    # 模块内部用 Write-Error 报错、用全局标记表示成功，这里据实汇报，不谎报成功
+                    $registerOutput = Register-AIPredictor *>&1 | Out-String
+                    if (Get-Variable -Name __AIPredictor_Registered -Scope Global -ErrorAction SilentlyContinue) {
+                        Write-Host '✅ AIPredictor 已注册，可用自然语言触发 AI 预测' -ForegroundColor DarkGray
+                    }
+                    else {
+                        # 只取第一行原因，避免刷屏；要看完整输出可手动执行 Register-AIPredictor
+                        $reason = ($registerOutput -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+                        Write-Warning "AIPredictor 未能注册（不影响终端使用）：$reason"
+                    }
                 }
                 catch {
-                    Write-Warning "[!] 包装 prompt 函数失败: $_"
+                    Write-Warning "AIPredictor 注册异常（不影响终端使用）：$($_.Exception.Message)"
                 }
             }
-        } catch {
-            Write-Warning "[!] AIPredictor 加载失败: $_"
-            Write-Host "    路径: $aiPredictorPath" -ForegroundColor Red
+
+            if ($global:__ProfileOriginalPrompt) {
+                & $global:__ProfileOriginalPrompt
+            }
+            else {
+                "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+            }
         }
-    } else {
-        Write-Host "未找到 AIPredictor 插件 → " -NoNewline
-        Write-Host $aiPredictorPath -ForegroundColor DarkGray
+    }
+
+    # ============================================================
+    # 7. 启动汇总
+    # ============================================================
+    if (-not $Quiet) {
+        Write-Host ''
+        Write-Host '=== PowerShell 配置已加载（稳定版 v1.0.0）===' -ForegroundColor Cyan
+        foreach ($item in $Summary) {
+            Write-Host "  $($item.Text)" -ForegroundColor $item.Color
+        }
+        Write-Host ''
     }
 }
-catch {
-    Write-Error "[模块加载失败] $_"
-    if ($module) {
-        Write-Host "    错误模块: $module" -ForegroundColor Red
-    }
-    exit 8
-}
-#endregion
-
-#region 智能预测配置
-try {
-    # 1. 检查 PSReadLine 是否可用
-    $psrlModule = Get-Module PSReadLine -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-    if (-not $psrlModule) {
-        Write-Warning "PSReadLine 未安装，跳过智能预测配置。"
-        return
-    }
-
-    # 2. 确保 PSReadLine 已加载
-    if (-not (Get-Module PSReadLine)) {
-        Import-Module PSReadLine -Force
-    }
-
-    # 3. 检查插件支持能力
-    $supportsPlugin = ([version]$psrlModule.Version -ge [version]"2.2.0")
-    if (-not $supportsPlugin) {
-        Write-Warning "PSReadLine 版本过低（当前 v$($psrlModule.Version)），需 ≥ 2.2.0 才支持 Plugin 预测。"
-        Set-PSReadLineOption -PredictionSource History
-        Set-PSReadLineOption -MaximumHistoryCount 100000
-        Set-PSReadLineOption -PredictionViewStyle InlineView
-        Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
-        return
-    }
-
-    # 4. 检测已加载的预测插件
-    $loadedPlugins = @()
-    if (Get-Module Az.Tools.Predictor) { $loadedPlugins += "Az.Tools.Predictor" }
-    if (Get-Module AIPredictor) { $loadedPlugins += "AIPredictor" }
-
-    # 5. 设置预测源
-    if ($loadedPlugins.Count -gt 0) {
-        Set-PSReadLineOption -PredictionSource HistoryAndPlugin
-        Write-Host "已启用智能预测（插件: $($loadedPlugins -join ', ')）" -ForegroundColor Green
-    } else {
-        Set-PSReadLineOption -PredictionSource History
-        Write-Host "未检测到预测插件，仅启用历史记录预测" -ForegroundColor Yellow
-    }
-
-    # 6. 统一设置其他 PSReadLine 选项（合理值）
-    Set-PSReadLineOption -MaximumHistoryCount 100000
-    Set-PSReadLineOption -PredictionViewStyle InlineView
-    Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
-
-    # 7. 用户提示（如果启用了 AI）
-    if ($loadedPlugins -contains "AIPredictor") {
-        $global:DebugAIPredictor = $true
-        Write-Host "💡 提示：输入自然语言（如 'delete old logs'）可触发 AI 预测" -ForegroundColor Cyan
-    }
-}
-catch {
-    Write-Error "[智能预测配置失败] $_"
-    # 安全回退
-    try {
-        Set-PSReadLineOption -PredictionSource History
-        Set-PSReadLineOption -MaximumHistoryCount 10000
-        Set-PSReadLineOption -PredictionViewStyle InlineView
-    }
-    catch {
-        # 静默
-    }
-}
-#endregion
-
-$global:DebugAIPredictor = $true
-
-Write-Host "`n配置文件加载完成`n" -ForegroundColor Green
