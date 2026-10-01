@@ -200,7 +200,7 @@
         try {
             Import-Module -Name $AiPredictorModule -Force -ErrorAction Stop
             $aiLoaded = $true
-            Add-Summary '模块 AIPredictor（AI 预测：行内建议 + Alt+P 快捷键）'
+            Add-Summary '模块 AIPredictor（中文输入按 Tab 出 AI 建议；Alt+P 直接问）'
         }
         catch {
             Write-Warning "AIPredictor 加载失败：$($_.Exception.Message)"

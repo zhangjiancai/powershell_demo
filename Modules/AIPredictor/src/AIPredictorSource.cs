@@ -82,6 +82,8 @@ namespace AIPredictor
             {
                 string line = GetInputLine(context);
                 string suggestion = Lookup(line);
+                Log("GetSuggestion: \"" + Shorten(line, 60) + "\" -> " +
+                    (string.IsNullOrEmpty(suggestion) ? "(无缓存，已排后台请求)" : "命中缓存"));
                 var entries = new List<PredictiveSuggestion>();
                 if (!string.IsNullOrEmpty(suggestion))
                 {
@@ -171,6 +173,7 @@ namespace AIPredictor
                 return;
             }
 
+            Log("发起请求: \"" + Shorten(line, 60) + "\"");
             double waitMs = _options.DebounceMs - (DateTime.UtcNow - _lastRequestUtc).TotalMilliseconds;
             Task.Run(async () =>
             {
@@ -301,6 +304,10 @@ namespace AIPredictor
             {
                 lock (LogLock)
                 {
+                    // 超过 1MB 就清空重来，避免日志无限膨胀
+                    var info = new FileInfo(_options.LogPath);
+                    if (info.Exists && info.Length > 1024 * 1024) File.WriteAllText(_options.LogPath, string.Empty);
+
                     File.AppendAllText(_options.LogPath,
                         DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message + Environment.NewLine,
                         new UTF8Encoding(false));
