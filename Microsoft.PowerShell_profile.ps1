@@ -1,24 +1,25 @@
 <#
 .SYNOPSIS
-    PowerShell 7 个人配置文件（稳定版 v1.2.0）
+    PowerShell 7 个人配置文件（稳定版 v1.3.0）
 
 .DESCRIPTION
     设计原则
       1. 绝不 exit —— 任何一项配置失败都不会关闭你的终端窗口
       2. 分块 try/catch —— oh-my-posh、代理、模块各自独立，互不影响
-      3. 只在交互式终端做交互的事 —— 管道 / 重定向 / CI 下自动跳过 PSReadLine、WinGet 等功能
+      3. 只在交互式终端做交互的事 —— 管道 / 重定向 / CI 下自动跳过 PSReadLine 等
       4. 路径集中在配置区，并且都能用环境变量覆盖，不必改本文件
 
     可用环境变量
       POSH_PROFILE_QUIET=1               启动时只显示警告，不打印汇总
       POSH_PROFILE_FORCE_INTERACTIVE=1   强制按交互式终端加载（排错用）
+      PROFILE_LOAD_AZ_PREDICTOR=1        加载 Az.Tools.Predictor（冷启动约多 6 秒）
       OHMYPOSH_EXE=<exe 路径>            覆盖 oh-my-posh 可执行文件位置
       OHMYPOSH_THEMES=<目录>             覆盖主题目录
       OHMYPOSH_THEME=<json 路径>         固定主题（不设置则每次随机）
 
 .NOTES
     文件：$PROFILE
-    仓库：本目录（git 管理，稳定版对应 tag v1.2.0）
+    仓库：本目录（git 管理，稳定版对应 tag v1.3.0）
 #>
 
 & {
@@ -165,15 +166,20 @@
     }
 
     # ============================================================
-    # 4. 模块加载
+    # 4. 模块加载（默认只加载必需项；单项失败只警告，不影响启动）
     # ============================================================
     $predictorLoaded = $false
     $aiLoaded        = $false
 
-    # Microsoft.WinGet.CommandNotFound 只在真正的控制台里加载：
-    # 它在非交互进程退出时会抛未处理异常（PowerToys 模块的已知问题）。
-    $modulesToLoad = @('Az.Tools.Predictor')
-    if ($IsConsole) { $modulesToLoad += 'Microsoft.WinGet.CommandNotFound' }
+    # 【已移除】Microsoft.WinGet.CommandNotFound（PowerToys 的“命令未找到→winget install”提示）
+    #   它在后台 WarmUp 时去连 WinGet 目录，连不上就抛未处理异常，会把整个 pwsh 进程杀掉。
+    #   实测：PowerShell 7.6.7 + 该模块 1.0.2.0，加不加代理都能复现，退出码 -532462766。
+    #   winget 本身不受影响；确实需要这个提示时手动 Import-Module，或升级 PowerToys 后再试。
+
+    # 【默认不加载】Az.Tools.Predictor 冷启动约 6 秒（它拖进来的 Az.Accounts 4.0.2 有 29 MB / 74 个文件）。
+    #   需要 Azure 参数补全时：设置 $env:PROFILE_LOAD_AZ_PREDICTOR = '1'，再开新窗口。
+    $modulesToLoad = @()
+    if ($env:PROFILE_LOAD_AZ_PREDICTOR -eq '1') { $modulesToLoad += 'Az.Tools.Predictor' }
 
     foreach ($moduleName in $modulesToLoad) {
         try {
@@ -240,7 +246,7 @@
     # ============================================================
     if (-not $Quiet) {
         Write-Host ''
-        Write-Host '=== PowerShell 配置已加载（稳定版 v1.2.0）===' -ForegroundColor Cyan
+        Write-Host '=== PowerShell 配置已加载（稳定版 v1.3.0）===' -ForegroundColor Cyan
         foreach ($item in $Summary) {
             Write-Host "  $($item.Text)" -ForegroundColor $item.Color
         }

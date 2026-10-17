@@ -3,7 +3,7 @@
 一套自用的 PowerShell 7 配置：**一个不会把终端搞崩的稳定 profile**，加上一个**真正能用的 AI 命令预测器**——
 输入中文按 `Tab`，AI 直接给出可执行的 PowerShell 命令。
 
-> 当前稳定版 **v1.2.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.6 + PSReadLine 2.4.5 + oh-my-posh 23.15.3
+> 当前稳定版 **v1.3.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.7 + PSReadLine 2.4.5 + oh-my-posh 23.15.3，启动约 **1.1 秒**
 
 ---
 
@@ -135,6 +135,7 @@ Register-AIPredictor      # 再打开
 | `OHMYPOSH_EXE=<路径>` | 覆盖 oh-my-posh 可执行文件位置 |
 | `OHMYPOSH_THEMES=<目录>` | 覆盖主题目录 |
 | `OHMYPOSH_THEME=<json>` | 固定主题（不设置则每次随机） |
+| `PROFILE_LOAD_AZ_PREDICTOR=1` | 加载 Az.Tools.Predictor（冷启动约多 6 秒，默认不加载） |
 | `AIPREDICTOR_SKIP_AUTOREGISTER=1` | 不自动注册 AI 预测器 |
 
 profile 的设计原则：
@@ -171,6 +172,8 @@ Test-AIPredictor
 | 改了 `AIPredictorSource.cs` 不生效 | 删除 `Modules/AIPredictor/bin` 后重开终端，会自动重新编译（缓存文件名带源码哈希） |
 | 启动报 `Unable to find type [AIPredictor...]` | 编译缓存异常：删 `bin` 目录后重开终端 |
 | 想彻底关掉 | `Unregister-AIPredictor`，或设 `$env:AIPREDICTOR_SKIP_AUTOREGISTER=1` |
+| 终端里出现 `An error has occurred that was not properly handled` 然后整个窗口消失 | 是 `Microsoft.WinGet.CommandNotFound`（PowerToys）后台预热 WinGet 目录失败导致的**未处理异常**，会把 pwsh 直接杀掉。profile 已不再导入它；`winget` 本身不受影响 |
+| 启动很慢（>5 秒） | 主要是 `Az.Tools.Predictor` 冷启动拖进来的 `Az.Accounts`（29 MB / 74 个文件）。已改为按需加载；需要 Azure 补全时设 `$env:PROFILE_LOAD_AZ_PREDICTOR=1` |
 
 日志在 `Modules/AIPredictor/ai_predictions.log`，每次查询、每次请求、每次错误都有时间戳。
 
@@ -200,11 +203,12 @@ Test-AIPredictor
 | `v1.0.0` | 稳定版 profile：移除全部 `exit`、按会话类型跳过交互功能、删除历史版本文件 |
 | `v1.1.0` | AIPredictor 真正可用：改用引擎预测子系统（C#）+ `Alt+P`；API 修正为 OpenAI 兼容模式 |
 | `v1.2.0` | 新增 Tab 出 AI 建议（修掉“真实操作没反应”）、修掉 4 个启动报错、API 换成 DeepSeek、新增自检命令 |
+| `v1.3.0` | 移除会把终端进程杀掉的 `Microsoft.WinGet.CommandNotFound`；`Az.Tools.Predictor` 改为按需加载（启动 7.3 s → 1.1 s）；适配 PowerShell 7.6.7 |
 
 回退单个文件：
 
 ```powershell
-git checkout v1.2.0 -- Microsoft.PowerShell_profile.ps1
+git checkout v1.3.0 -- Microsoft.PowerShell_profile.ps1
 ```
 
 ---
