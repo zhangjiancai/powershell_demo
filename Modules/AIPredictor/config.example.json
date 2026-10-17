@@ -12,9 +12,14 @@
   "MaxSuggestionLength": 500,
   "CacheTtlSeconds": 600,
   "AllowMultiLine": true,
+  "CandidateCount": 3,
+  "EnableMultiCandidate": true,
   "Hotkey": "Alt+P",
   "EnableTabCompletion": true,
   "EnableLog": true,
+  "LogInputs": false,
   "LogPath": "ai_predictions.log",
+  "PriceInPerM": 0,
+  "PriceOutPerM": 0,
   "SystemPrompt": ""
 }

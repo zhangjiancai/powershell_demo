@@ -18,6 +18,14 @@
 
 #  触发规则（v1.4.0 起）：只有“像自然语言”的输入才会真的发请求；
 #  缓存默认 10 分钟过期；同一行同时只有一个在途请求（连按 Tab/Alt+P 不会重复打 API）。
+
+#  v1.5.0 新增：
+#    · 一次给多个候选方案（Tab 菜单里选，默认 3 个，CandidateCount 可调）
+#    · 安全刹车：高风险命令（递归删除 / 格式化磁盘 / git reset --hard 等）
+#      · Tab 菜单里直接拦掉，不会让你手滑回车；
+#      · Alt+P 需要连按两次确认才插入。
+#    · 隐私日志：默认只记长度/语言/耗时，不记你输入的原话（LogInputs=true 才记）。
+#    · 用量统计：Get-AIPredictorStatus -Stats（请求数 / 缓存命中率 / 延迟 / tokens / 估算成本）。
 #
 #  为什么用 C#：PowerShell 类也能实现 ICommandPredictor，但返回值 SuggestionPackage 是
 #  结构体，PS 类 → CLR 接口的封送会丢内容（实测引擎只收到空包）。
@@ -31,6 +39,8 @@ $script:Config     = $null
 $script:TypeName   = "AIPredictor.AIPredictorSource"
 $script:TypeLoaded = $false
 $script:Hotkey     = ""
+$script:PendingDangerCommand = $null   # 等待第二次 Alt+P 确认的高风险命令
+$script:PendingDangerAt = $null
 
 # 版本号以 psd1 清单为准（单一来源）
 $script:ModuleVersion = "0.0"
@@ -63,6 +73,11 @@ function Get-AIPredictorConfig {
         EnableTabCompletion = $true
         CacheTtlSeconds     = 600
         AllowMultiLine      = $true
+        LogInputs           = $false
+        CandidateCount      = 3
+        EnableMultiCandidate = $true
+        PriceInPerM         = 0
+        PriceOutPerM        = 0
         EnableLog           = $false
         LogPath             = (Join-Path $PSScriptRoot "ai_predictions.log")
         SystemPrompt        = ""
@@ -148,12 +163,16 @@ function Initialize-AIPredictor {
     foreach ($key in "ApiKey", "Model", "Endpoint", "LogPath", "SystemPrompt") {
         if ($config[$key]) { $options.$key = [string]$config[$key] }
     }
-    foreach ($key in "TimeoutSeconds", "MinInputLength", "DebounceMs", "MaxTokens", "MaxCacheEntries", "MaxSuggestionLength", "CacheTtlSeconds") {
+    foreach ($key in "TimeoutSeconds", "MinInputLength", "DebounceMs", "MaxTokens", "MaxCacheEntries", "MaxSuggestionLength", "CacheTtlSeconds", "CandidateCount") {
         if ($config[$key]) { $options.$key = [int]$config[$key] }
     }
     if ($config["Temperature"]) { $options.Temperature = [double]$config["Temperature"] }
+    if ($config["PriceInPerM"])  { $options.PriceInPerM  = [double]$config["PriceInPerM"] }
+    if ($config["PriceOutPerM"]) { $options.PriceOutPerM = [double]$config["PriceOutPerM"] }
     $options.EnableLog = [bool]$config["EnableLog"]
     $options.AllowMultiLine = [bool]$config["AllowMultiLine"]
+    $options.LogInputs = [bool]$config["LogInputs"]
+    $options.EnableMultiCandidate = [bool]$config["EnableMultiCandidate"]
 
     $script:Instance = [AIPredictor.AIPredictorSource]::new($options)
     return $script:Instance
@@ -213,6 +232,27 @@ $script:KeyHandler = {
     }
 
     if ($suggestion) {
+        $dangerReason = [AIPredictor.AIPredictorSource]::GetDangerReason($suggestion)
+        if ($dangerReason) {
+            if ($script:Instance) { $script:Instance.NoteSafetyBlock() }
+            $now = Get-Date
+            $confirmed = ($script:PendingDangerCommand -eq $suggestion) -and
+                         $script:PendingDangerAt -and
+                         (($now - $script:PendingDangerAt).TotalSeconds -lt 30)
+            if (-not $confirmed) {
+                $script:PendingDangerCommand = $suggestion
+                $script:PendingDangerAt = $now
+                Write-Host ""
+                Write-Host "⚠ 高风险命令（$dangerReason）：" -ForegroundColor Yellow
+                Write-Host "   $suggestion" -ForegroundColor Yellow
+                Write-Host "   再按一次 Alt+P 确认插入；30 秒内不确认自动失效" -ForegroundColor DarkGray
+                return
+            }
+            $script:PendingDangerCommand = $null
+            $script:PendingDangerAt = $null
+            Write-Host ""
+            Write-Host "⚠ 已确认插入高风险命令（$dangerReason），请检查无误后再回车" -ForegroundColor Yellow
+        }
         [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $suggestion, $null, $null)
     }
     else {
@@ -262,18 +302,25 @@ $script:TabExpansionWrapper = {
         return $base
     }
 
-    $suggestion = $null
+    $candidates = @()
     try {
         $timeoutMs = [int]($script:Config["TimeoutSeconds"] * 1000)
         if ($timeoutMs -lt 3000) { $timeoutMs = 3000 }
+        $candidateCount = [int]$script:Config["CandidateCount"]
+        if ($candidateCount -lt 1) { $candidateCount = 1 }
         $title = $null
         try { $title = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = "⏳ AIPredictor 正在向 AI 询问…" } catch { }
-        try { $suggestion = $script:Instance.Query($line, $timeoutMs) }
+        try { $candidates = @($script:Instance.QueryCandidates($line, $timeoutMs, $candidateCount)) }
         finally { if ($title) { try { $Host.UI.RawUI.WindowTitle = $title } catch { } } }
     }
-    catch { }
+    catch { $candidates = @() }
 
-    if (-not $suggestion) {
+    # 多行脚本在 Tab 菜单里放不下（换行会破坏菜单），交给 Alt+P 整段插入
+    $singleLine = @($candidates | Where-Object { $_ -and $_.IndexOf([char]10) -lt 0 })
+    if ($candidates.Count -gt 0 -and $singleLine.Count -eq 0) {
+        Write-Host "   AIPredictor：AI 给出的是多行脚本，按 Alt+P 可整段插入" -ForegroundColor DarkGray
+    }
+    if ($singleLine.Count -eq 0) {
         if ($script:Instance -and $script:Instance.LastError) {
             Write-Warning "AIPredictor: $($script:Instance.LastError)"
             Write-Host "   已回退到普通补全；排查请运行 Test-AIPredictor" -ForegroundColor DarkGray
@@ -282,21 +329,40 @@ $script:TabExpansionWrapper = {
         return $base
     }
 
-    # 多行脚本在 Tab 菜单里没法用（换行会破坏菜单），改由 Alt+P 整段插入
-    if ($suggestion.IndexOf([char]10) -ge 0) {
-        Write-Host "   AIPredictor：AI 给出的是多行脚本，按 Alt+P 可整段插入" -ForegroundColor DarkGray
+    # 安全刹车：高风险方案不放进 Tab 菜单（避免手滑回车）
+    $safe = @()
+    $blocked = 0
+    $blockedReasons = @()
+    foreach ($candidate in $singleLine) {
+        $reason = [AIPredictor.AIPredictorSource]::GetDangerReason($candidate)
+        if ($reason) {
+            $blocked++
+            if ($blockedReasons -notcontains $reason) { $blockedReasons += $reason }
+        }
+        else { $safe += $candidate }
+    }
+    if ($blocked -gt 0 -and $script:Instance) { $script:Instance.NoteSafetyBlock() }
+    if ($blocked -gt 0) {
+        Write-Host ("   ⚠ 已拦截 {0} 个高风险建议（{1}）；确实需要请按 Alt+P 确认插入" -f $blocked, ($blockedReasons -join "、")) -ForegroundColor Yellow
+    }
+    if ($safe.Count -eq 0) {
         if ($null -eq $base) { $base = New-EmptyCompletion }
         return $base
     }
 
-    $item = [System.Management.Automation.CompletionResult]::new(
-        $suggestion,
-        $suggestion,
-        [System.Management.Automation.CompletionResultType]::Text,
-        "AI 建议（$($script:Config["Model"])）：回车/Tab 采用，替换整行"
-    )
     $matches = [System.Collections.ObjectModel.Collection[System.Management.Automation.CompletionResult]]::new()
-    $matches.Add($item)
+    $index = 0
+    foreach ($candidate in $safe) {
+        $index++
+        $tip = if ($safe.Count -eq 1) {
+            "AI 建议（$($script:Config["Model"])）：回车/Tab 采用，替换整行"
+        }
+        else {
+            "方案 $index/$($safe.Count)（AI）：回车/Tab 采用，替换整行"
+        }
+        $matches.Add([System.Management.Automation.CompletionResult]::new(
+            $candidate, $candidate, [System.Management.Automation.CompletionResultType]::Text, $tip))
+    }
     return [System.Management.Automation.CommandCompletion]::new($matches, 0, 0, $line.Length)
 }
 
@@ -402,10 +468,12 @@ function Get-AIPredictorSuggestion {
 function Get-AIPredictorStatus {
     <#
     .SYNOPSIS
-        查看 AI 预测器的配置与注册状态；排查问题先看它。
+        查看 AI 预测器的配置与注册状态；-Stats 额外显示用量统计。
+    .EXAMPLE
+        Get-AIPredictorStatus -Stats
     #>
     [CmdletBinding()]
-    param()
+    param([switch]$Stats)
 
     $config = Get-AIPredictorConfig
     $instance = $script:Instance
@@ -418,6 +486,31 @@ function Get-AIPredictorStatus {
 
     $predictionSource = "n/a"
     try { $predictionSource = (Get-PSReadLineOption).PredictionSource } catch { }
+
+    # 注意：变量名不能叫 $stats —— 会和 [switch]$Stats 参数冲突（PowerShell 变量名大小写不敏感）
+    $statistics = $null
+    if ($instance) { $statistics = $instance.Stats }
+
+    if ($Stats -and $statistics) {
+        Write-Host ""
+        Write-Host "=== AIPredictor 用量统计（本次会话）===" -ForegroundColor Cyan
+        Write-Host ("  请求次数    : {0}（失败 {1}）" -f $statistics.Requests, $statistics.Failures)
+        Write-Host ("  缓存        : 命中率 {0}%（命中 {1} / 未命中 {2}，当前缓存 {3} 条）" -f $statistics.HitRate, $statistics.CacheHits, $statistics.CacheMisses, $instance.CacheCount)
+        Write-Host ("  延迟        : 平均 {0} ms（最近 {1} ms）" -f $statistics.AvgLatencyMs, [int]$statistics.LastLatencyMs)
+        Write-Host ("  行内建议    : 显示 {0} 次" -f $statistics.InlineHits)
+        Write-Host ("  安全刹车    : {0} 次" -f $statistics.SafetyBlocks)
+        Write-Host ("  Tokens      : 输入 {0} / 输出 {1}" -f $statistics.PromptTokens, $statistics.CompletionTokens)
+        $priceIn = [double]$config["PriceInPerM"]
+        $priceOut = [double]$config["PriceOutPerM"]
+        if ($priceIn -gt 0 -or $priceOut -gt 0) {
+            $cost = ($statistics.PromptTokens / 1000000.0) * $priceIn + ($statistics.CompletionTokens / 1000000.0) * $priceOut
+            Write-Host ("  估算成本    : {0:N4}（按每百万 token 输入 {1} / 输出 {2}）" -f $cost, $priceIn, $priceOut)
+        }
+        else {
+            Write-Host "  估算成本    : 未配置单价（config.json 里设 PriceInPerM / PriceOutPerM 即可显示）" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+    }
 
     [pscustomobject]@{
         Version          = $script:ModuleVersion
@@ -433,6 +526,7 @@ function Get-AIPredictorStatus {
         AllowMultiLine   = [bool]$config["AllowMultiLine"]
         LastError        = $(if ($instance) { $instance.LastError } else { "" })
         LogPath          = $config["LogPath"]
+        Stats            = $statistics
     }
 }
 
@@ -482,6 +576,8 @@ function Test-AIPredictor {
     Write-Item "预测源" "$source" $(if ($source -eq "Plugin" -or $source -eq "HistoryAndPlugin") { "Green" } else { "Yellow" })
     Write-Item "快捷键" $(if ($script:Hotkey) { $script:Hotkey } else { "未绑定（非交互式会话属正常）" }) $(if ($script:Hotkey) { "Green" } else { "Yellow" })
     Write-Item "Tab 接管" $(if ($script:TabCompletionEnabled) { "已接管（自然语言整句按 Tab 出 AI 建议）" } else { "未接管" }) $(if ($script:TabCompletionEnabled) { "Green" } else { "Yellow" })
+    Write-Item "多候选" $(if ($config["EnableMultiCandidate"]) { "开启（每次 $($config["CandidateCount"]) 个方案，高风险自动拦截）" } else { "关闭" }) "Gray"
+    Write-Item "隐私日志" $(if ($config["LogInputs"]) { "会记录输入原文" } else { "只记长度/语言/耗时（不记原文）" }) "Gray"
 
     Write-Host "  实测一次 API 请求..."
     $sw = [System.Diagnostics.Stopwatch]::StartNew()

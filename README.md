@@ -3,7 +3,7 @@
 一套自用的 PowerShell 7 配置：**一个不会把终端搞崩的稳定 profile**，加上一个**真正能用的 AI 命令预测器**——
 输入自然语言（中文或英文整句）按 `Tab`，AI 直接给出可执行的 PowerShell 命令。
 
-> 当前稳定版 **v1.4.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.7 + PSReadLine 2.4.5 + oh-my-posh 23.15.3，启动约 **1.1–2.1 秒**
+> 当前稳定版 **v1.5.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.7 + PSReadLine 2.4.5 + oh-my-posh 23.15.3，启动约 **1.1–2.1 秒**
 
 ---
 
@@ -25,10 +25,11 @@
 | 路径 | 说明 |
 | --- | --- |
 | `Microsoft.PowerShell_profile.ps1` | 主配置文件（稳定版）：oh-my-posh 随机主题、系统代理→环境变量、命令历史、模块加载、接入 AI 预测器 |
-| `Modules/AIPredictor/AIPredictor.psm1` | AI 预测器模块：编译并注册 C# 预测器、绑定 `Alt+P`、接管 `Tab`、提供 `Test-AIPredictor` 自检 |
+| `Modules/AIPredictor/AIPredictor.psm1` | AI 预测器模块：编译并注册 C# 预测器、绑定 `Alt+P`、接管 `Tab`（多候选 + 安全刹车）、提供 `Test-AIPredictor` 自检 |
 | `Modules/AIPredictor/src/AIPredictorSource.cs` | 预测器本体（C#，实现引擎的 `ICommandPredictor`）：缓存 + 异步请求 + 输出清洗 |
 | `Modules/AIPredictor/config.example.json` | 配置模板。复制为 `config.json` 并填 API Key（`config.json` 含密钥，已被 .gitignore 排除） |
 | `Scripts/Clean-OldModules.ps1` | 清理 `Modules` 目录里旧版本模块的小脚本 |
+| `Scripts/Test-NoSecrets.ps1` + `Scripts/hooks/` | 敏感信息扫描器，以及 `pre-commit` / `commit-msg` 两个 git 钩子 |
 | `powershell.config.json` | PowerShell 实验特性开关（PSFeedbackProvider / PSCommandNotFoundSuggestion） |
 | `symboliclink/` | 早期笔记：尝试用符号链接把命令历史备份到 OneDrive |
 | `powershell_random_theme_oh_my_posh/` | 早期的随机主题 profile（历史版本，留作参考） |
@@ -78,6 +79,8 @@ Test-AIPredictor
 | --- | --- | --- |
 | **Tab（推荐）** | 输入自然语言 → 按 `Tab` | 中文整句、英文整句（如 `list the largest files`）都行；菜单第一项就是 AI 给出的整行命令，回车/Tab 采用（同步等待约 1 秒）。命令编辑（`./xxx`、`git xxx`、带路径/参数）不会被接管，原生补全照旧 |
 | 多行脚本 | 需要脚本时按 `Alt+P` | AI 返回多行脚本时，Tab 菜单放不下（会提示改用 Alt+P）；Alt+P 整段插入，绝不会只截取函数体中间那一行 |
+| 多候选 | 按 `Tab` 后看菜单 | 一次给 3 个不同方案（最稳妥 / 更简洁 / 更彻底），用方向键挑；`CandidateCount` 可调 |
+| 安全刹车 | 自动 | 高风险命令（递归删除、格式化磁盘、`git reset --hard`、`iex` 等）在 Tab 菜单里**直接拦掉**并提示原因；`Alt+P` 需要**连按两次确认**才插入 |
 | `Alt+P` | 输入后按 `Alt+P` | 立即问 AI 并把建议写进命令行，**不会自动执行** |
 | 行内灰字 | 出现灰字后按 `→` | 附带效果：PSReadLine 只在缓冲区变化时查询预测器，AI 答案通常晚到，所以不稳定 |
 | 脚本调用 | `Get-AIPredictorSuggestion -InputText "列出最大的文件"` | 直接返回字符串，可嵌进自己的脚本 |
@@ -111,10 +114,14 @@ Register-AIPredictor      # 再打开
 | `MaxSuggestionLength` | 500 | 建议最大长度 |
 | `CacheTtlSeconds` | 600 | 结果缓存有效期（秒），过期重新问 AI |
 | `AllowMultiLine` | `true` | 允许 AI 返回多行脚本（通过 Alt+P 插入；Tab 只接受单行） |
+| `CandidateCount` | 3 | Tab 一次给几个候选方案 |
+| `EnableMultiCandidate` | `true` | 关闭则 Tab 只给一条 |
 | `Hotkey` | `Alt+P` | 留空则不绑定 |
 | `EnableTabCompletion` | `true` | 自然语言整句时接管 Tab |
 | `EnableLog` | `true` | 写运行日志，排查问题用 |
 | `LogPath` | `ai_predictions.log` | 日志位置（超过 1 MB 自动截断） |
+| `LogInputs` | `false` | 日志是否记录你输入的原文。默认只记长度/语言/耗时 |
+| `PriceInPerM` / `PriceOutPerM` | 0 | 每百万 token 单价；填了之后 `-Stats` 会估算成本 |
 | `SystemPrompt` | 空 | 自定义系统提示词 |
 
 换成别的服务商只需改三行，例如阿里云百炼：
@@ -173,13 +180,15 @@ Test-AIPredictor
 | Tab 提示“多行脚本，按 Alt+P” | 正常行为：Tab 菜单放不下多行，改用 `Alt+P` 整段插入 |
 | API 请求失败 | 自检会打印确切错误；检查 Key、Endpoint，以及**代理**（`HTTP_PROXY` 会影响请求） |
 | 行内灰字不出现 | 属正常现象，见[工作原理](#工作原理)，请用 Tab 或 Alt+P |
+| Tab 提示“已拦截 N 个高风险建议” | 安全刹车生效：确实要执行就按 `Alt+P`，再按一次确认插入 |
+| 想看看用量 | `Get-AIPredictorStatus -Stats`：请求数 / 命中率 / 延迟 / tokens / 估算成本 |
 | 改了 `AIPredictorSource.cs` 不生效 | 删除 `Modules/AIPredictor/bin` 后重开终端，会自动重新编译（缓存文件名带源码哈希） |
 | 启动报 `Unable to find type [AIPredictor...]` | 编译缓存异常：删 `bin` 目录后重开终端 |
 | 想彻底关掉 | `Unregister-AIPredictor`，或设 `$env:AIPREDICTOR_SKIP_AUTOREGISTER=1` |
 | 终端里出现 `An error has occurred that was not properly handled` 然后整个窗口消失 | 是 `Microsoft.WinGet.CommandNotFound`（PowerToys）后台预热 WinGet 目录失败导致的**未处理异常**，会把 pwsh 直接杀掉。profile 已不再导入它；`winget` 本身不受影响 |
 | 启动很慢（>5 秒） | 主要是 `Az.Tools.Predictor` 冷启动拖进来的 `Az.Accounts`（29 MB / 74 个文件）。已改为按需加载；需要 Azure 补全时设 `$env:PROFILE_LOAD_AZ_PREDICTOR=1` |
 
-日志在 `Modules/AIPredictor/ai_predictions.log`，每次查询、每次请求、每次错误都有时间戳。
+日志在 `Modules/AIPredictor/ai_predictions.log`，记录每次请求、耗时与错误。**默认不写你输入的原文**（只记长度/语言）；要完整记录输入可在 `config.json` 里设 `LogInputs: true`。
 
 ---
 
@@ -193,7 +202,8 @@ Test-AIPredictor
 
   ```powershell
   pwsh -File Scripts/Test-NoSecrets.ps1 -All                    # 手动全量检查
-  Copy-Item Scripts/hooks/pre-commit .git/hooks/pre-commit     # 安装 pre-commit 钩子
+  Copy-Item Scripts/hooks/pre-commit .git/hooks/pre-commit     # 检查暂存区文件
+  Copy-Item Scripts/hooks/commit-msg .git/hooks/commit-msg     # 检查提交信息（防止 key 写进 commit message）
   ```
 
   误报可以 `git commit --no-verify` 跳过。
@@ -209,11 +219,12 @@ Test-AIPredictor
 | `v1.2.0` | 新增 Tab 出 AI 建议（修掉“真实操作没反应”）、修掉 4 个启动报错、API 换成 DeepSeek、新增自检命令 |
 | `v1.3.0` | 移除会把终端进程杀掉的 `Microsoft.WinGet.CommandNotFound`；`Az.Tools.Predictor` 改为按需加载（启动 7.3 s → 1.1 s）；适配 PowerShell 7.6.7 |
 | `v1.4.0` | 只对自然语言发请求（不再被命令编辑触发，约省 79% 调用）；拒答/说明文字不再当命令；多行脚本安全处理；缓存 TTL；请求去重；英文自然语言支持；补 `.psd1` 清单（版本 1.4.0） |
+| `v1.5.0` | 多候选方案（Tab 菜单 3 选 1）；高风险命令安全刹车（Tab 拦截 / Alt+P 二次确认）；隐私日志（默认不记输入原文）；用量统计 `-Stats`；`commit-msg` 钩子；仓库清理旧对象 |
 
 回退单个文件：
 
 ```powershell
-git checkout v1.4.0 -- Microsoft.PowerShell_profile.ps1
+git checkout v1.5.0 -- Microsoft.PowerShell_profile.ps1
 ```
 
 ---

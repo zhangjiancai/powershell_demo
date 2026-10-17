@@ -12,7 +12,8 @@
 param(
     [switch]$Staged,
     [switch]$All,
-    [string[]]$Path
+    [string[]]$Path,
+    [string]$MessageFile      # commit-msg 钩子用：检查提交信息本身
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +53,27 @@ function Get-FileText([string]$file) {
 $files = if ($Path) { $Path } elseif ($All) { @(git ls-files) } else { @(git diff --cached --name-only --diff-filter=ACM) }
 
 $problems = @()
+
+# 提交信息检查模式（commit-msg 钩子）：只扫提交说明本身，不扫文件
+if ($MessageFile) {
+    $files = @()
+    if (Test-Path -LiteralPath $MessageFile) {
+        $lineNo = 0
+        foreach ($line in ((Get-Content -LiteralPath $MessageFile -Raw) -split '\r?\n')) {
+            $lineNo++
+            if ($line.TrimStart().StartsWith('#')) { continue }    # 忽略 git 自动生成的注释行
+            foreach ($p in $patterns) {
+                if ($line -notmatch $p.Regex) { continue }
+                if ($line -match $placeholder) { continue }
+                $shown = $line.Trim()
+                if ($shown.Length -gt 90) { $shown = $shown.Substring(0, 90) + '...' }
+                $shown = $shown -replace '([A-Za-z0-9_\-]{6})[A-Za-z0-9_\-]{10,}', '$1***'
+                $problems += ('[提交信息]' + ' 第 ' + $lineNo + ' 行: ' + $shown)
+                break
+            }
+        }
+    }
+}
 foreach ($file in $files) {
     if ([string]::IsNullOrWhiteSpace($file)) { continue }
 

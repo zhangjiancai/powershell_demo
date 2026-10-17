@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    PowerShell 7 个人配置文件（稳定版 v1.4.0）
+    PowerShell 7 个人配置文件（稳定版 v1.5.0）
 
 .DESCRIPTION
     设计原则
@@ -19,7 +19,7 @@
 
 .NOTES
     文件：$PROFILE
-    仓库：本目录（git 管理，稳定版对应 tag v1.4.0）
+    仓库：本目录（git 管理，稳定版对应 tag v1.5.0）
 #>
 
 & {
@@ -248,7 +248,7 @@
     # ============================================================
     if (-not $Quiet) {
         Write-Host ''
-        Write-Host '=== PowerShell 配置已加载（稳定版 v1.4.0）===' -ForegroundColor Cyan
+        Write-Host '=== PowerShell 配置已加载（稳定版 v1.5.0）===' -ForegroundColor Cyan
         foreach ($item in $Summary) {
             Write-Host "  $($item.Text)" -ForegroundColor $item.Color
         }

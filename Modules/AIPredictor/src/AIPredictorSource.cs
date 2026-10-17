@@ -40,6 +40,11 @@ namespace AIPredictor
         public int MaxSuggestionLength { get; set; } = 500;
         public int CacheTtlSeconds { get; set; } = 600;
         public bool AllowMultiLine { get; set; } = true;
+        public bool LogInputs { get; set; } = false;         // 日志里是否记录原始输入（默认只记长度/语言）
+        public int CandidateCount { get; set; } = 3;          // Tab 一次给几个候选方案
+        public bool EnableMultiCandidate { get; set; } = true;
+        public double PriceInPerM { get; set; } = 0;          // 每百万输入 token 的价格（0 = 只显示 token 数）
+        public double PriceOutPerM { get; set; } = 0;
         public bool EnableLog { get; set; } = false;
         public string LogPath { get; set; } = string.Empty;
         public string SystemPrompt { get; set; } = string.Empty;
@@ -71,6 +76,54 @@ namespace AIPredictor
             public DateTime Utc;
         }
 
+        /// <summary>运行统计快照（供 Get-AIPredictorStatus -Stats 展示）。</summary>
+        public sealed class AIPredictorStats
+        {
+            public long Requests { get; set; }
+            public long Failures { get; set; }
+            public long CacheHits { get; set; }
+            public long CacheMisses { get; set; }
+            public long InlineHits { get; set; }
+            public long SafetyBlocks { get; set; }
+            public long PromptTokens { get; set; }
+            public long CompletionTokens { get; set; }
+            public double TotalLatencyMs { get; set; }
+            public double LastLatencyMs { get; set; }
+            public double AvgLatencyMs { get { return Requests > 0 ? Math.Round(TotalLatencyMs / Requests, 0) : 0; } }
+            public double HitRate { get { long t = CacheHits + CacheMisses; return t > 0 ? Math.Round(100.0 * CacheHits / t, 1) : 0; } }
+        }
+
+        /// <summary>高风险命令规则：正则 → 人话原因。</summary>
+        private static readonly string[,] DangerRules = new string[,]
+        {
+            { @"(?i)\bremove-item\b.*-recurse", "递归删除文件/目录" },
+            { @"(?i)\bremove-item\b.*-force", "强制删除（不进回收站）" },
+            { @"(?i)\b(rd|rmdir)\b.*/s", "递归删除目录" },
+            { @"(?i)\brm\b.*-r", "递归删除" },
+            { @"(?i)\bdel\b.*/f", "强制删除文件" },
+            { @"(?i)\bformat-volume\b", "格式化卷（数据全丢）" },
+            { @"(?i)\b(clear-disk|initialize-disk)\b", "清空/初始化磁盘（数据全丢）" },
+            { @"(?i)\b(stop-computer|restart-computer)\b", "关机 / 重启" },
+            { @"(?i)\bclear-recyclebin\b", "清空回收站" },
+            { @"(?i)\bgit\s+reset\s+--hard\b", "丢弃所有未提交改动" },
+            { @"(?i)\bgit\s+clean\s+-[a-z]*f", "强制删除未跟踪文件" },
+            { @"(?i)\bset-executionpolicy\b.*unrestricted", "降低执行策略限制" },
+            { @"(?i)\b(invoke-expression|iex)\b", "动态执行字符串（可被注入）" },
+            { @"(?i)\breg\s+delete\b", "删除注册表项" },
+            { @"(?i)\bicacls\b.*(/grant|/reset)", "修改文件权限" },
+            { @"(?i)\btakeown\b", "夺取文件所有权" },
+            { @"(?i)\bset-mppreference\b.*disable", "关闭杀毒防护" },
+            { @"(?i)\bnetsh\b.*firewall", "修改防火墙" }
+        };
+
+        // 多个候选方案的在途请求（Tab 连按不重复打 API）
+        private readonly ConcurrentDictionary<string, Task<string[]>> _inflightMulti =
+            new ConcurrentDictionary<string, Task<string[]>>(StringComparer.Ordinal);
+
+        // 运行统计（用量面板）
+        private long _requests, _failures, _cacheHits, _cacheMisses, _inlineHits, _safetyBlocks, _promptTokens, _completionTokens;
+        private double _totalLatencyMs, _lastLatencyMs;
+
         private string _pending;              // 最新等待请求的输入（尾沿防抖）
         private int _busy;                    // 0/1：是否有请求在飞
         private DateTime _lastRequestUtc = DateTime.MinValue;
@@ -100,10 +153,12 @@ namespace AIPredictor
                 string line = GetInputLine(context);
                 string suggestion = Lookup(line);
                 bool multiLine = !string.IsNullOrEmpty(suggestion) && suggestion.IndexOf('\n') >= 0;
-                string state = string.IsNullOrEmpty(suggestion)
-                    ? "(无缓存，已排后台请求)"
-                    : (multiLine ? "命中缓存（多行脚本，行内不显示）" : "命中缓存");
-                Log("GetSuggestion: \"" + Shorten(line, 60) + "\" -> " + state);
+                // 不逐键记录输入（隐私 + 降噪）；真正发请求由 PumpRequests 记录
+                if (!string.IsNullOrEmpty(suggestion) && !multiLine)
+                {
+                    Interlocked.Increment(ref _inlineHits);
+                    Log("行内建议显示: " + Describe(line));
+                }
                 var entries = new List<PredictiveSuggestion>();
                 if (!string.IsNullOrEmpty(suggestion) && !multiLine)
                 {
@@ -125,7 +180,7 @@ namespace AIPredictor
 
         public void OnSuggestionAccepted(PredictionClient client, uint session, string acceptedSuggestion)
         {
-            Log("已采纳: " + acceptedSuggestion);
+            Log("已采纳: " + (_options.LogInputs ? acceptedSuggestion : "len=" + acceptedSuggestion.Length));
         }
 
         public void OnSuggestionDisplayed(PredictionClient client, uint session, int countOrLength) { }
@@ -138,6 +193,41 @@ namespace AIPredictor
         public int CacheCount => _cache.Count;
         public bool HasApiKey => !string.IsNullOrWhiteSpace(_options.ApiKey);
 
+        /// <summary>运行统计快照。</summary>
+        public AIPredictorStats Stats
+        {
+            get
+            {
+                return new AIPredictorStats
+                {
+                    Requests = Interlocked.Read(ref _requests),
+                    Failures = Interlocked.Read(ref _failures),
+                    CacheHits = Interlocked.Read(ref _cacheHits),
+                    CacheMisses = Interlocked.Read(ref _cacheMisses),
+                    InlineHits = Interlocked.Read(ref _inlineHits),
+                    SafetyBlocks = Interlocked.Read(ref _safetyBlocks),
+                    PromptTokens = Interlocked.Read(ref _promptTokens),
+                    CompletionTokens = Interlocked.Read(ref _completionTokens),
+                    TotalLatencyMs = _totalLatencyMs,
+                    LastLatencyMs = _lastLatencyMs
+                };
+            }
+        }
+
+        /// <summary>记录一次“安全刹车”（高风险建议被拦截或被警告）。</summary>
+        public void NoteSafetyBlock() { Interlocked.Increment(ref _safetyBlocks); }
+
+        /// <summary>判断命令是否高风险；返回人话原因（null = 安全）。</summary>
+        public static string GetDangerReason(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command)) return null;
+            for (int i = 0; i < DangerRules.GetLength(0); i++)
+            {
+                if (Regex.IsMatch(command, DangerRules[i, 0])) return DangerRules[i, 1];
+            }
+            return null;
+        }
+
         /// <summary>查缓存；未命中则安排后台请求并返回 null。</summary>
         public string Lookup(string line)
         {
@@ -145,7 +235,8 @@ namespace AIPredictor
             line = line.Trim();
 
             string cached = GetCached(line);
-            if (cached != null) return cached;
+            if (cached != null) { Interlocked.Increment(ref _cacheHits); return cached; }
+            Interlocked.Increment(ref _cacheMisses);
 
             _pending = line;
             PumpRequests();
@@ -159,7 +250,8 @@ namespace AIPredictor
             line = line.Trim();
 
             string cached = GetCached(line);
-            if (cached != null) return cached;
+            if (cached != null) { Interlocked.Increment(ref _cacheHits); return cached; }
+            Interlocked.Increment(ref _cacheMisses);
 
             int wait = Math.Max(1000, timeoutMs);
             try
@@ -198,7 +290,7 @@ namespace AIPredictor
                 return;
             }
 
-            Log("发起请求: \"" + Shorten(line, 60) + "\"");
+            Log("发起请求: " + Describe(line));
             double waitMs = _options.DebounceMs - (DateTime.UtcNow - _lastRequestUtc).TotalMilliseconds;
             Task.Run(async () =>
             {
@@ -272,12 +364,23 @@ namespace AIPredictor
 
         private async Task<string> FetchAsync(string line)
         {
+            string content = await CallModelAsync(line, null).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(content)) return null;
+            return Sanitize(content, _options.MaxSuggestionLength, _options.AllowMultiLine);
+        }
+
+        /// <summary>发一次 chat 请求，返回模型原始文本；失败返回 null 并设置 LastError。</summary>
+        private async Task<string> CallModelAsync(string userContent, string extraInstruction)
+        {
             if (!HasApiKey) { LastError = "未配置 ApiKey"; return null; }
+
+            string system = BuildSystemPrompt();
+            if (!string.IsNullOrWhiteSpace(extraInstruction)) system = system + "\n\n" + extraInstruction;
 
             var messages = new List<object>
             {
-                new { role = "system", content = BuildSystemPrompt() },
-                new { role = "user", content = line }
+                new { role = "system", content = system },
+                new { role = "user", content = userContent }
             };
             var payload = new
             {
@@ -289,39 +392,70 @@ namespace AIPredictor
             };
 
             string json = JsonSerializer.Serialize(payload);
-            using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
-            using (HttpResponseMessage response = await _client.PostAsync(_options.Endpoint, content).ConfigureAwait(false))
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            Interlocked.Increment(ref _requests);
+
+            try
             {
-                string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode)
+                using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+                using (HttpResponseMessage response = await _client.PostAsync(_options.Endpoint, content).ConfigureAwait(false))
                 {
-                    LastError = "HTTP " + (int)response.StatusCode + ": " + Shorten(body, 200);
-                    Log("HTTP 错误: " + LastError);
-                    return null;
-                }
-
-                using (JsonDocument document = JsonDocument.Parse(body))
-                {
-                    JsonElement root = document.RootElement;
-                    JsonElement choices;
-                    if (!root.TryGetProperty("choices", out choices) ||
-                        choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
+                    string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
                     {
-                        LastError = "响应中没有 choices";
+                        Interlocked.Increment(ref _failures);
+                        LastError = "HTTP " + (int)response.StatusCode + ": " + Shorten(body, 200);
+                        Log("HTTP 错误: " + LastError);
                         return null;
                     }
 
-                    JsonElement message;
-                    JsonElement contentElement;
-                    if (!choices[0].TryGetProperty("message", out message) ||
-                        !message.TryGetProperty("content", out contentElement))
+                    using (JsonDocument document = JsonDocument.Parse(body))
                     {
-                        LastError = "响应结构不认识";
-                        return null;
-                    }
+                        JsonElement root = document.RootElement;
+                        JsonElement choices;
+                        if (!root.TryGetProperty("choices", out choices) ||
+                            choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
+                        {
+                            Interlocked.Increment(ref _failures);
+                            LastError = "响应中没有 choices";
+                            return null;
+                        }
 
-                    return Sanitize(contentElement.GetString(), _options.MaxSuggestionLength, _options.AllowMultiLine);
+                        JsonElement message;
+                        JsonElement contentElement;
+                        if (!choices[0].TryGetProperty("message", out message) ||
+                            !message.TryGetProperty("content", out contentElement))
+                        {
+                            Interlocked.Increment(ref _failures);
+                            LastError = "响应结构不认识";
+                            return null;
+                        }
+
+                        JsonElement usage;
+                        if (root.TryGetProperty("usage", out usage))
+                        {
+                            JsonElement token;
+                            if (usage.TryGetProperty("prompt_tokens", out token)) Interlocked.Add(ref _promptTokens, token.GetInt64());
+                            if (usage.TryGetProperty("completion_tokens", out token)) Interlocked.Add(ref _completionTokens, token.GetInt64());
+                        }
+
+                        return contentElement.GetString();
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref _failures);
+                LastError = ex.Message;
+                Log("请求异常: " + ex.Message);
+                return null;
+            }
+            finally
+            {
+                watch.Stop();
+                _lastLatencyMs = watch.Elapsed.TotalMilliseconds;
+                _totalLatencyMs += _lastLatencyMs;
+                Log("请求耗时: " + (int)_lastLatencyMs + " ms");
             }
         }
 
@@ -360,7 +494,7 @@ namespace AIPredictor
             if (_cache.Count >= _options.MaxCacheEntries) _cache.Clear();
             _cache[line] = new CacheEntry { Text = suggestion, Utc = DateTime.UtcNow };
             LastError = string.Empty;
-            Log("预测: " + line + "  =>  " + suggestion);
+            Log("预测: " + Describe(line) + "  =>  " + (_options.LogInputs ? suggestion : "len=" + suggestion.Length));
         }
 
         /// <summary>同一行同时最多一个在途请求；完成后自动写缓存（连按 Tab/Alt+P 不会重复打 API）。</summary>
@@ -379,6 +513,84 @@ namespace AIPredictor
                 }, TaskScheduler.Default);
                 return task;
             });
+        }
+
+        /// <summary>一次请求拿多个候选方案（Tab 菜单用）；命中单条缓存时直接返回那一条。</summary>
+        public string[] QueryCandidates(string line, int timeoutMs, int count)
+        {
+            if (!IsEligible(line)) return new string[0];
+            line = line.Trim();
+            if (count < 1) count = 1;
+
+            string cached = GetCached(line);
+            if (cached != null) { Interlocked.Increment(ref _cacheHits); return new[] { cached }; }
+            Interlocked.Increment(ref _cacheMisses);
+
+            if (!_options.EnableMultiCandidate || count <= 1)
+            {
+                string single = Query(line, timeoutMs);
+                return string.IsNullOrEmpty(single) ? new string[0] : new[] { single };
+            }
+
+            int wait = Math.Max(1000, timeoutMs);
+            try
+            {
+                Task<string[]> task = GetOrStartFetchCandidates(line, count);
+                if (task.Wait(wait))
+                {
+                    string[] result = task.Result;
+                    if (result != null && result.Length > 0) return result;
+                    LastError = "模型没有给出可用的候选命令";
+                }
+                else
+                {
+                    LastError = "请求超时（" + wait + " ms），结果到了会进缓存，可稍后再按一次";
+                }
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                Log("候选查询失败: " + ex.Message);
+            }
+            return new string[0];
+        }
+
+        private Task<string[]> GetOrStartFetchCandidates(string line, int count)
+        {
+            return _inflightMulti.GetOrAdd(line, l =>
+            {
+                Task<string[]> task = FetchCandidatesAsync(l, count);
+                task.ContinueWith(done =>
+                {
+                    _inflightMulti.TryRemove(l, out _);
+                    if (done.Status == TaskStatus.RanToCompletion && done.Result != null && done.Result.Length > 0)
+                    {
+                        Store(l, done.Result[0]);   // 第一条同时进单条缓存，Alt+P 可直接用
+                    }
+                }, TaskScheduler.Default);
+                return task;
+            });
+        }
+
+        private async Task<string[]> FetchCandidatesAsync(string line, int count)
+        {
+            string instruction =
+                "这次请给出 " + count + " 个不同思路的 PowerShell 实现方案。" +
+                "每个方案单独一行、只写命令本身，不要编号、不要解释、不要 Markdown 代码块。" +
+                "优先给出风险最低的方案，再给更简洁或更彻底的方案。";
+            string content = await CallModelAsync(line, instruction).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(content)) return new string[0];
+
+            var result = new List<string>();
+            foreach (string rawLine in content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+            {
+                string one = Sanitize(rawLine, _options.MaxSuggestionLength, false);
+                if (string.IsNullOrEmpty(one)) continue;
+                if (result.Contains(one)) continue;
+                result.Add(one);
+                if (result.Count >= count) break;
+            }
+            return result.ToArray();
         }
 
         private void Log(string message)
@@ -518,6 +730,14 @@ namespace AIPredictor
                 if (count == 2) return value.Substring(1, value.Length - 2).Trim();
             }
             return value;
+        }
+
+        /// <summary>日志里描述一段输入：默认只记长度和语言；LogInputs=true 时才记原文。</summary>
+        private string Describe(string line)
+        {
+            if (string.IsNullOrEmpty(line)) return "(空)";
+            if (_options.LogInputs) return "\"" + Shorten(line, 80) + "\"";
+            return "len=" + line.Length + " lang=" + (CjkPattern.IsMatch(line) ? "zh" : "en");
         }
 
         private static string Shorten(string value, int max)

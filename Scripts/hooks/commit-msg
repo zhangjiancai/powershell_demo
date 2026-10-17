@@ -1,0 +1,8 @@
+#!/bin/sh
+# 提交信息敏感信息检查（安装：Copy-Item Scripts/hooks/commit-msg .git/hooks/commit-msg）
+msgfile="$1"
+root=$(git rev-parse --show-toplevel)
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh -NoProfile -File "$root/Scripts/Test-NoSecrets.ps1" -MessageFile "$msgfile" || exit 1
+fi
+exit 0
