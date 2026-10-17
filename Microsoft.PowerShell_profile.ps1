@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    PowerShell 7 个人配置文件（稳定版 v1.3.0）
+    PowerShell 7 个人配置文件（稳定版 v1.4.0）
 
 .DESCRIPTION
     设计原则
@@ -19,7 +19,7 @@
 
 .NOTES
     文件：$PROFILE
-    仓库：本目录（git 管理，稳定版对应 tag v1.3.0）
+    仓库：本目录（git 管理，稳定版对应 tag v1.4.0）
 #>
 
 & {
@@ -36,7 +36,7 @@
     $PinnedTheme = $env:OHMYPOSH_THEME
 
     $HistoryPath       = Join-Path $ProfileDir 'PSReadLine\ConsoleHost_history.txt'
-    $AiPredictorModule = Join-Path $ProfileDir 'Modules\AIPredictor\AIPredictor.psm1'
+    $AiPredictorModule = Join-Path $ProfileDir 'Modules\AIPredictor'   # 目录（含 AIPredictor.psd1 清单）
 
     # 是否真正的交互式控制台（Windows Terminal / VS Code 终端都算；管道、重定向、CI 不算）
     $IsConsole = $false
@@ -201,12 +201,14 @@
     }
 
     # 本地 AI 预测插件（可选：文件不存在或加载失败都只是跳过）
-    # 模块导入时会自行完成：编译/加载 C# 预测器 → 注册到引擎 → 绑定 Alt+P 快捷键
-    if ($IsConsole -and (Test-Path -LiteralPath $AiPredictorModule -PathType Leaf)) {
+    # 模块导入时会自行完成：编译/加载 C# 预测器 → 注册到引擎 → 绑定 Alt+P、接管 Tab
+    $AiPredictorManifest = Join-Path $AiPredictorModule 'AIPredictor.psd1'
+    if ($IsConsole -and (Test-Path -LiteralPath $AiPredictorManifest -PathType Leaf)) {
         try {
             Import-Module -Name $AiPredictorModule -Force -ErrorAction Stop
             $aiLoaded = $true
-            Add-Summary '模块 AIPredictor（中文输入按 Tab 出 AI 建议；Alt+P 直接问）'
+            $aiVersion = (Get-Module AIPredictor).Version
+            Add-Summary "模块 AIPredictor v$aiVersion（Tab 出 AI 建议 / Alt+P 直接问）"
         }
         catch {
             Write-Warning "AIPredictor 加载失败：$($_.Exception.Message)"
@@ -246,7 +248,7 @@
     # ============================================================
     if (-not $Quiet) {
         Write-Host ''
-        Write-Host '=== PowerShell 配置已加载（稳定版 v1.3.0）===' -ForegroundColor Cyan
+        Write-Host '=== PowerShell 配置已加载（稳定版 v1.4.0）===' -ForegroundColor Cyan
         foreach ($item in $Summary) {
             Write-Host "  $($item.Text)" -ForegroundColor $item.Color
         }

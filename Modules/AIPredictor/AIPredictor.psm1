@@ -8,10 +8,16 @@
 #    编译并注册进去，于是你输入自然语言时，行内就会出现 AI 给出的命令建议。
 #
 #  三种用法：
-#    1) 按 Tab    ：输入中文后按 Tab，菜单第一项就是 AI 给出的整行命令，回车/Tab 采用（推荐）
-#    2) Alt+P     ：立即问 AI 并把建议写进命令行（默认 Alt+P，可在 config.json 改）
+#    1) 按 Tab    ：输入自然语言（中文整句，或英文整句如 "list the largest files"）后按 Tab，
+#                   菜单第一项就是 AI 给出的整行命令，回车/Tab 采用（推荐）。
+#                   命令编辑（./xxx、git xxx、带路径/参数的输入）不会被接管，原生补全照旧。
+#    2) Alt+P     ：立即问 AI 并把建议写进命令行（默认 Alt+P，可在 config.json 改）。
+#                   AI 返回多行脚本时也由它整段插入（Tab 菜单放不下多行）。
 #    3) 行内灰字  ：PSReadLine 只在“缓冲区变化”时查询预测器，AI 答案晚到 1 秒通常来不及显示；
 #                   当某行已缓存且再次被查询时会显示（按 → 接受）。所以主力是前两种。
+
+#  触发规则（v1.4.0 起）：只有“像自然语言”的输入才会真的发请求；
+#  缓存默认 10 分钟过期；同一行同时只有一个在途请求（连按 Tab/Alt+P 不会重复打 API）。
 #
 #  为什么用 C#：PowerShell 类也能实现 ICommandPredictor，但返回值 SuggestionPackage 是
 #  结构体，PS 类 → CLR 接口的封送会丢内容（实测引擎只收到空包）。
@@ -25,6 +31,13 @@ $script:Config     = $null
 $script:TypeName   = "AIPredictor.AIPredictorSource"
 $script:TypeLoaded = $false
 $script:Hotkey     = ""
+
+# 版本号以 psd1 清单为准（单一来源）
+$script:ModuleVersion = "0.0"
+$manifestPath = Join-Path $PSScriptRoot "AIPredictor.psd1"
+if (Test-Path -LiteralPath $manifestPath) {
+    try { $script:ModuleVersion = [string](Import-PowerShellDataFile -LiteralPath $manifestPath).ModuleVersion } catch { }
+}
 $script:TabCompletionEnabled = $false
 $script:OriginalTabExpansion2  = $null
 
@@ -48,6 +61,8 @@ function Get-AIPredictorConfig {
         MaxSuggestionLength = 500
         Hotkey              = "Alt+P"
         EnableTabCompletion = $true
+        CacheTtlSeconds     = 600
+        AllowMultiLine      = $true
         EnableLog           = $false
         LogPath             = (Join-Path $PSScriptRoot "ai_predictions.log")
         SystemPrompt        = ""
@@ -133,11 +148,12 @@ function Initialize-AIPredictor {
     foreach ($key in "ApiKey", "Model", "Endpoint", "LogPath", "SystemPrompt") {
         if ($config[$key]) { $options.$key = [string]$config[$key] }
     }
-    foreach ($key in "TimeoutSeconds", "MinInputLength", "DebounceMs", "MaxTokens", "MaxCacheEntries", "MaxSuggestionLength") {
+    foreach ($key in "TimeoutSeconds", "MinInputLength", "DebounceMs", "MaxTokens", "MaxCacheEntries", "MaxSuggestionLength", "CacheTtlSeconds") {
         if ($config[$key]) { $options.$key = [int]$config[$key] }
     }
     if ($config["Temperature"]) { $options.Temperature = [double]$config["Temperature"] }
     $options.EnableLog = [bool]$config["EnableLog"]
+    $options.AllowMultiLine = [bool]$config["AllowMultiLine"]
 
     $script:Instance = [AIPredictor.AIPredictorSource]::new($options)
     return $script:Instance
@@ -225,14 +241,12 @@ function Set-AIPredictorKeyHandler {
 }
 
 # ------------------------------------------------------------------------
-# Tab 补全接管：输入含中文时，Tab 菜单第一项就是 AI 给出的整行命令
+# Tab 补全接管：输入像自然语言时，Tab 菜单第一项就是 AI 给出的整行命令
 #
 #   为什么需要它：PSReadLine 只在“缓冲区发生变化”时查询预测器，AI 的答案晚到 1 秒，
 #   那时已经没有触发点，所以行内灰字经常根本不会出现。Tab 是用户主动触发，
 #   可以同步等答案，稳定可用。（行内预测仍保留，命中缓存时会显示）
 # ------------------------------------------------------------------------
-$script:CjkPattern = "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]"
-
 $script:TabExpansionWrapper = {
     param($line, $cursorColumn)
 
@@ -240,8 +254,10 @@ $script:TabExpansionWrapper = {
     $base = $null
     try { if ($script:OriginalTabExpansion2) { $base = & $script:OriginalTabExpansion2 $line $cursorColumn } } catch { $base = $null }
 
-    # 只接管“像自然语言”的输入（含中文/日文/韩文），普通命令输入完全不受影响
-    if ([string]::IsNullOrWhiteSpace($line) -or $line -notmatch $script:CjkPattern) {
+    # 只接管“像自然语言”的输入（中/英整句），命令编辑完全不受影响；
+    # 判断与 C# 预测器共用同一个方法，避免两边规则不一致
+    if ([string]::IsNullOrWhiteSpace($line) -or
+        -not [AIPredictor.AIPredictorSource]::IsNaturalLanguage($line)) {
         if ($null -eq $base) { $base = New-EmptyCompletion }
         return $base
     }
@@ -262,6 +278,13 @@ $script:TabExpansionWrapper = {
             Write-Warning "AIPredictor: $($script:Instance.LastError)"
             Write-Host "   已回退到普通补全；排查请运行 Test-AIPredictor" -ForegroundColor DarkGray
         }
+        if ($null -eq $base) { $base = New-EmptyCompletion }
+        return $base
+    }
+
+    # 多行脚本在 Tab 菜单里没法用（换行会破坏菜单），改由 Alt+P 整段插入
+    if ($suggestion.IndexOf([char]10) -ge 0) {
+        Write-Host "   AIPredictor：AI 给出的是多行脚本，按 Alt+P 可整段插入" -ForegroundColor DarkGray
         if ($null -eq $base) { $base = New-EmptyCompletion }
         return $base
     }
@@ -397,6 +420,7 @@ function Get-AIPredictorStatus {
     try { $predictionSource = (Get-PSReadLineOption).PredictionSource } catch { }
 
     [pscustomobject]@{
+        Version          = $script:ModuleVersion
         Model            = $config["Model"]
         Endpoint         = $config["Endpoint"]
         ApiKey           = $maskedKey
@@ -405,6 +429,8 @@ function Get-AIPredictorStatus {
         PredictionSource = $predictionSource
         Hotkey           = $(if ($script:Hotkey) { $script:Hotkey } else { "(未绑定)" })
         CacheCount       = $(if ($instance) { $instance.CacheCount } else { 0 })
+        CacheTtlSeconds  = $config["CacheTtlSeconds"]
+        AllowMultiLine   = [bool]$config["AllowMultiLine"]
         LastError        = $(if ($instance) { $instance.LastError } else { "" })
         LogPath          = $config["LogPath"]
     }
@@ -455,7 +481,7 @@ function Test-AIPredictor {
     try { $source = (Get-PSReadLineOption).PredictionSource } catch { }
     Write-Item "预测源" "$source" $(if ($source -eq "Plugin" -or $source -eq "HistoryAndPlugin") { "Green" } else { "Yellow" })
     Write-Item "快捷键" $(if ($script:Hotkey) { $script:Hotkey } else { "未绑定（非交互式会话属正常）" }) $(if ($script:Hotkey) { "Green" } else { "Yellow" })
-    Write-Item "Tab 接管" $(if ($script:TabCompletionEnabled) { "已接管（含中文时 Tab 出 AI 建议）" } else { "未接管" }) $(if ($script:TabCompletionEnabled) { "Green" } else { "Yellow" })
+    Write-Item "Tab 接管" $(if ($script:TabCompletionEnabled) { "已接管（自然语言整句按 Tab 出 AI 建议）" } else { "未接管" }) $(if ($script:TabCompletionEnabled) { "Green" } else { "Yellow" })
 
     Write-Host "  实测一次 API 请求..."
     $sw = [System.Diagnostics.Stopwatch]::StartNew()

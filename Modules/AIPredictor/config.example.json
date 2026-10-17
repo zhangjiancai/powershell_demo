@@ -10,6 +10,8 @@
   "Temperature": 0.2,
   "MaxCacheEntries": 200,
   "MaxSuggestionLength": 500,
+  "CacheTtlSeconds": 600,
+  "AllowMultiLine": true,
   "Hotkey": "Alt+P",
   "EnableTabCompletion": true,
   "EnableLog": true,

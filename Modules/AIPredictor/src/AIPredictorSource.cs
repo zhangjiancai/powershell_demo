@@ -38,6 +38,8 @@ namespace AIPredictor
         public double Temperature { get; set; } = 0.2;
         public int MaxCacheEntries { get; set; } = 200;
         public int MaxSuggestionLength { get; set; } = 500;
+        public int CacheTtlSeconds { get; set; } = 600;
+        public bool AllowMultiLine { get; set; } = true;
         public bool EnableLog { get; set; } = false;
         public string LogPath { get; set; } = string.Empty;
         public string SystemPrompt { get; set; } = string.Empty;
@@ -51,8 +53,23 @@ namespace AIPredictor
 
         private readonly AIPredictorOptions _options;
         private readonly HttpClient _client;
-        private readonly ConcurrentDictionary<string, string> _cache =
-            new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, CacheEntry> _cache =
+            new ConcurrentDictionary<string, CacheEntry>(StringComparer.Ordinal);
+
+        // 同一行同时最多一个在途请求（Tab/Alt+P 连按不会重复打 API）
+        private readonly ConcurrentDictionary<string, Task<string>> _inflight =
+            new ConcurrentDictionary<string, Task<string>>(StringComparer.Ordinal);
+
+        // 中日韩文字：出现即按自然语言处理
+        private static readonly Regex CjkPattern = new Regex(
+            "[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uac00-\\ud7af]",
+            RegexOptions.Compiled);
+
+        private sealed class CacheEntry
+        {
+            public string Text;
+            public DateTime Utc;
+        }
 
         private string _pending;              // 最新等待请求的输入（尾沿防抖）
         private int _busy;                    // 0/1：是否有请求在飞
@@ -82,10 +99,13 @@ namespace AIPredictor
             {
                 string line = GetInputLine(context);
                 string suggestion = Lookup(line);
-                Log("GetSuggestion: \"" + Shorten(line, 60) + "\" -> " +
-                    (string.IsNullOrEmpty(suggestion) ? "(无缓存，已排后台请求)" : "命中缓存"));
+                bool multiLine = !string.IsNullOrEmpty(suggestion) && suggestion.IndexOf('\n') >= 0;
+                string state = string.IsNullOrEmpty(suggestion)
+                    ? "(无缓存，已排后台请求)"
+                    : (multiLine ? "命中缓存（多行脚本，行内不显示）" : "命中缓存");
+                Log("GetSuggestion: \"" + Shorten(line, 60) + "\" -> " + state);
                 var entries = new List<PredictiveSuggestion>();
-                if (!string.IsNullOrEmpty(suggestion))
+                if (!string.IsNullOrEmpty(suggestion) && !multiLine)
                 {
                     entries.Add(new PredictiveSuggestion(suggestion, "AI · " + _options.Model + "（Enter 执行，Tab 菜单另可选）"));
                 }
@@ -124,8 +144,8 @@ namespace AIPredictor
             if (!IsEligible(line)) return null;
             line = line.Trim();
 
-            string cached;
-            if (_cache.TryGetValue(line, out cached)) return cached;
+            string cached = GetCached(line);
+            if (cached != null) return cached;
 
             _pending = line;
             PumpRequests();
@@ -138,18 +158,23 @@ namespace AIPredictor
             if (!IsEligible(line)) return null;
             line = line.Trim();
 
-            string cached;
-            if (_cache.TryGetValue(line, out cached)) return cached;
+            string cached = GetCached(line);
+            if (cached != null) return cached;
 
+            int wait = Math.Max(1000, timeoutMs);
             try
             {
-                Task<string> task = FetchAsync(line);
-                if (task.Wait(Math.Max(1000, timeoutMs)) && !string.IsNullOrEmpty(task.Result))
+                Task<string> task = GetOrStartFetch(line);
+                if (task.Wait(wait))
                 {
-                    Store(line, task.Result);
-                    return task.Result;
+                    string result = task.Result;
+                    if (!string.IsNullOrEmpty(result)) return result;
+                    LastError = "模型没有给出可用的命令（可能只返回了说明文字或多行脚本）";
                 }
-                LastError = "请求超时或返回为空（" + Math.Max(1000, timeoutMs) + " ms）";
+                else
+                {
+                    LastError = "请求超时（" + wait + " ms），结果到了会进缓存，可稍后再按一次";
+                }
             }
             catch (Exception ex)
             {
@@ -181,8 +206,7 @@ namespace AIPredictor
                 {
                     if (waitMs > 0) await Task.Delay((int)waitMs).ConfigureAwait(false);
                     _lastRequestUtc = DateTime.UtcNow;
-                    string result = await FetchAsync(line).ConfigureAwait(false);
-                    if (!string.IsNullOrEmpty(result)) Store(line, result);
+                    await GetOrStartFetch(line).ConfigureAwait(false);   // 结果由 GetOrStartFetch 统一写缓存
                 }
                 catch (Exception ex)
                 {
@@ -203,9 +227,37 @@ namespace AIPredictor
             if (!HasApiKey) return false;
             line = line.Trim();
             if (line.Length < _options.MinInputLength) return false;
-            // 纯 cmdlet / 参数（英文数字连字符）不打扰 AI，正常打字不触发请求
-            if (Regex.IsMatch(line, "^[a-zA-Z][a-zA-Z0-9-]*$")) return false;
-            return true;
+            return IsNaturalLanguage(line);
+        }
+
+        /// <summary>
+        /// 判断输入是不是“自然语言需求”，而不是在编辑命令。
+        /// PowerShell 侧的 Tab 接管调用同一个方法，保证两边判断一致。
+        /// </summary>
+        public static bool IsNaturalLanguage(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return false;
+            line = line.Trim();
+
+            // 1) 开头就是命令形态 → 不是自然语言
+            if (line.StartsWith("./") || line.StartsWith(".\\") || line.StartsWith("/") ||
+                line.StartsWith("\\") || line.StartsWith("$") || line.StartsWith("&") ||
+                line.StartsWith("@") || line.StartsWith("\"") || line.StartsWith("'") ||
+                line.StartsWith("-")) return false;
+            if (Regex.IsMatch(line, @"^[A-Za-z]:[\\/]?")) return false;                                  // 盘符
+            if (Regex.IsMatch(line, @"^[A-Za-z][A-Za-z0-9]*(-[A-Za-z][A-Za-z0-9]*)+")) return false;     // cmdlet
+            if (Regex.IsMatch(line, @"(?i)^(adb|git|npm|pnpm|yarn|pip|pip3|docker|winget|dotnet|node|python|python3|kubectl|curl|ssh|scp|choco|scoop|go|cargo|java|javac|mvn|gradle|az|gh|aws|terraform|pwsh|powershell|cmd|bash|wsl|reg|sc|netsh|ipconfig|ping|tracert|nslookup|tasklist|taskkill|echo|type|dir|ls|cat|cp|mv|rm|mkdir|rmdir|del|copy|move|ren|sort|find|findstr|grep|sed|awk|tar|zip|unzip|7z|code|start|explorer|cd|cls|clear|exit|where|which)(\s|$)")) return false;
+
+            // 2) 含中日韩文字 → 按自然语言处理
+            if (CjkPattern.IsMatch(line)) return true;
+
+            // 3) 英文：必须像一句话（至少 3 个词），且没有路径/参数/管道等命令痕迹
+            if (line.IndexOf('\\') >= 0 || line.IndexOf('/') >= 0) return false;
+            if (line.IndexOf('|') >= 0 || line.IndexOf('>') >= 0 || line.IndexOf('=') >= 0) return false;
+            if (Regex.IsMatch(line, @"(^|\s)--?[A-Za-z]")) return false;                                  // -Path / --flag
+            if (line.EndsWith("|") || line.EndsWith("\\")) return false;
+            string[] words = Regex.Split(line, @"\s+");
+            return words.Length >= 3;
         }
 
         private static string GetInputLine(PredictionContext context)
@@ -268,7 +320,7 @@ namespace AIPredictor
                         return null;
                     }
 
-                    return Sanitize(contentElement.GetString(), _options.MaxSuggestionLength);
+                    return Sanitize(contentElement.GetString(), _options.MaxSuggestionLength, _options.AllowMultiLine);
                 }
             }
         }
@@ -289,12 +341,44 @@ namespace AIPredictor
             try { return Environment.CurrentDirectory; } catch { return "?"; }
         }
 
+        /// <summary>查缓存（带 TTL；过期就当没有）。</summary>
+        private string GetCached(string line)
+        {
+            CacheEntry entry;
+            if (!_cache.TryGetValue(line, out entry)) return null;
+            if (_options.CacheTtlSeconds > 0 &&
+                (DateTime.UtcNow - entry.Utc).TotalSeconds > _options.CacheTtlSeconds)
+            {
+                _cache.TryRemove(line, out _);
+                return null;
+            }
+            return entry.Text;
+        }
+
         private void Store(string line, string suggestion)
         {
             if (_cache.Count >= _options.MaxCacheEntries) _cache.Clear();
-            _cache[line] = suggestion;
+            _cache[line] = new CacheEntry { Text = suggestion, Utc = DateTime.UtcNow };
             LastError = string.Empty;
             Log("预测: " + line + "  =>  " + suggestion);
+        }
+
+        /// <summary>同一行同时最多一个在途请求；完成后自动写缓存（连按 Tab/Alt+P 不会重复打 API）。</summary>
+        private Task<string> GetOrStartFetch(string line)
+        {
+            return _inflight.GetOrAdd(line, l =>
+            {
+                Task<string> task = FetchAsync(l);
+                task.ContinueWith(done =>
+                {
+                    _inflight.TryRemove(l, out _);
+                    if (done.Status == TaskStatus.RanToCompletion && !string.IsNullOrEmpty(done.Result))
+                    {
+                        Store(l, done.Result);
+                    }
+                }, TaskScheduler.Default);
+                return task;
+            });
         }
 
         private void Log(string message)
@@ -318,8 +402,13 @@ namespace AIPredictor
 
         // ---------------- 文本清洗 ----------------
 
-        /// <summary>把模型输出整成一条可以直接放进命令行的命令。</summary>
+        /// <summary>把模型输出整成可直接放进命令行的命令。说明文字会被丢弃；多行脚本按 allowMultiLine 决定是否返回。</summary>
         public static string Sanitize(string raw, int maxLength)
+        {
+            return Sanitize(raw, maxLength, true);
+        }
+
+        public static string Sanitize(string raw, int maxLength, bool allowMultiLine)
         {
             if (string.IsNullOrWhiteSpace(raw)) return null;
 
@@ -333,9 +422,8 @@ namespace AIPredictor
                 if (end >= 0) text = text.Substring(0, end);
             }
 
-            // 逐行打分：说明文字（以冒号结尾等）会被跳过，优先挑出真正像命令的那一行
-            string best = null;
-            int bestScore = int.MinValue;
+            // 1) 逐行清洗，并丢掉“说明文字/拒答”行
+            var commands = new List<string>();
             foreach (string rawLine in text.Split('\n'))
             {
                 string candidate = rawLine.Trim().Trim('`').Trim();
@@ -350,19 +438,59 @@ namespace AIPredictor
 
                 candidate = TrimWrappingQuotes(candidate);
                 if (candidate.Length == 0) continue;
-
-                int score = ScoreLine(candidate);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    best = candidate;
-                    if (score >= 6) break;   // 已经是明显的 cmdlet，不用再挑
-                }
+                if (IsProseLine(candidate)) continue;
+                commands.Add(candidate);
             }
 
-            if (best == null) return null;
-            if (best.Length > maxLength) best = best.Substring(0, maxLength).TrimEnd();
-            return best.Length == 0 ? null : best;
+            if (commands.Count == 0) return null;   // 整段都是说明文字 → 不给建议
+
+            // 2) 只有一行命令 → 直接用
+            if (commands.Count == 1)
+            {
+                string single = commands[0];
+                if (single.Length > maxLength) single = single.Substring(0, maxLength).TrimEnd();
+                return single.Length == 0 ? null : single;
+            }
+
+            // 3) 多行：像脚本才返回；否则宁可不出建议，也绝不截取函数体中间的某一行
+            if (!allowMultiLine || !LooksLikeScript(commands)) return null;
+
+            string script = string.Join("\n", commands);
+            if (script.Length > maxLength) script = script.Substring(0, maxLength).TrimEnd();
+            return script.Length == 0 ? null : script;
+        }
+
+        /// <summary>这一行像不像“人话”（说明/抱歉/拒答），而不是命令。</summary>
+        private static bool IsProseLine(string line)
+        {
+            if (CjkPattern.IsMatch(line))
+            {
+                // 中文里带命令特征（参数/管道/括号/引号/路径）才当命令，否则就是说明文字
+                if (Regex.IsMatch(line, @"[|&$(){}\[\]`=]")) return false;
+                if (line.IndexOf('-') >= 0) return false;
+                if (line.IndexOf('\\') >= 0 || line.IndexOf('/') >= 0) return false;
+                return true;
+            }
+            if (Regex.IsMatch(line, @"(?i)^(sorry|i can|i cannot|i am|please|here is|here are|the following|you can|note:|explanation:|this )")) return true;
+            return false;
+        }
+
+        /// <summary>多行内容像不像一段脚本（而不是一句命令加几句解释）。</summary>
+        private static bool LooksLikeScript(List<string> lines)
+        {
+            int commandish = 0;
+            foreach (string line in lines)
+            {
+                if (ScoreLine(line) > 0 || line.IndexOf('|') >= 0) commandish++;
+            }
+
+            string joined = string.Join(" ", lines);
+            // 有花括号 / 函数定义 / 变量 / 管道 → 明显是脚本
+            if (joined.IndexOf('{') >= 0 || joined.IndexOf('}') >= 0) return true;
+            if (joined.IndexOf("function ", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (joined.IndexOf('$') >= 0 || joined.IndexOf('|') >= 0) return true;
+            // 每一行都是命令（比如两三条 cmdlet 串起来）→ 也当作脚本
+            return commandish >= 2 && commandish == lines.Count;
         }
 
         /// <summary>给一行文本打分：越像 PowerShell 命令分越高，纯说明文字得负分。</summary>

@@ -1,9 +1,9 @@
 # PowerShell 配置 + AI 命令预测（AIPredictor）
 
 一套自用的 PowerShell 7 配置：**一个不会把终端搞崩的稳定 profile**，加上一个**真正能用的 AI 命令预测器**——
-输入中文按 `Tab`，AI 直接给出可执行的 PowerShell 命令。
+输入自然语言（中文或英文整句）按 `Tab`，AI 直接给出可执行的 PowerShell 命令。
 
-> 当前稳定版 **v1.3.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.7 + PSReadLine 2.4.5 + oh-my-posh 23.15.3，启动约 **1.1 秒**
+> 当前稳定版 **v1.4.0** ｜ 适用：Windows + PowerShell 7.2 及以上 ｜ 实测：PowerShell 7.6.7 + PSReadLine 2.4.5 + oh-my-posh 23.15.3，启动约 **1.1–2.1 秒**
 
 ---
 
@@ -76,7 +76,8 @@ Test-AIPredictor
 
 | 方式 | 操作 | 说明 |
 | --- | --- | --- |
-| **Tab（推荐）** | 输入中文 → 按 `Tab` | 菜单第一项就是 AI 给出的整行命令，回车/Tab 采用（同步等待约 1 秒）。普通命令输入仍然走原生补全 |
+| **Tab（推荐）** | 输入自然语言 → 按 `Tab` | 中文整句、英文整句（如 `list the largest files`）都行；菜单第一项就是 AI 给出的整行命令，回车/Tab 采用（同步等待约 1 秒）。命令编辑（`./xxx`、`git xxx`、带路径/参数）不会被接管，原生补全照旧 |
+| 多行脚本 | 需要脚本时按 `Alt+P` | AI 返回多行脚本时，Tab 菜单放不下（会提示改用 Alt+P）；Alt+P 整段插入，绝不会只截取函数体中间那一行 |
 | `Alt+P` | 输入后按 `Alt+P` | 立即问 AI 并把建议写进命令行，**不会自动执行** |
 | 行内灰字 | 出现灰字后按 `→` | 附带效果：PSReadLine 只在缓冲区变化时查询预测器，AI 答案通常晚到，所以不稳定 |
 | 脚本调用 | `Get-AIPredictorSuggestion -InputText "列出最大的文件"` | 直接返回字符串，可嵌进自己的脚本 |
@@ -108,8 +109,10 @@ Register-AIPredictor      # 再打开
 | `Temperature` | 0.2 | 越低越稳定 |
 | `MaxCacheEntries` | 200 | 结果缓存条数 |
 | `MaxSuggestionLength` | 500 | 建议最大长度 |
+| `CacheTtlSeconds` | 600 | 结果缓存有效期（秒），过期重新问 AI |
+| `AllowMultiLine` | `true` | 允许 AI 返回多行脚本（通过 Alt+P 插入；Tab 只接受单行） |
 | `Hotkey` | `Alt+P` | 留空则不绑定 |
-| `EnableTabCompletion` | `true` | 中文输入时接管 Tab |
+| `EnableTabCompletion` | `true` | 自然语言整句时接管 Tab |
 | `EnableLog` | `true` | 写运行日志，排查问题用 |
 | `LogPath` | `ai_predictions.log` | 日志位置（超过 1 MB 自动截断） |
 | `SystemPrompt` | 空 | 自定义系统提示词 |
@@ -166,7 +169,8 @@ Test-AIPredictor
 
 | 症状 | 处理 |
 | --- | --- |
-| 按 Tab 没有 AI 建议 | 确认输入**含中文字符**（只对自然语言接管）；确认 `EnableTabCompletion: true`；看自检输出 |
+| 按 Tab 没有 AI 建议 | 确认输入是**自然语言整句**（`./adb shell ...`、`git status` 这类命令编辑按设计不接管）；确认 `EnableTabCompletion: true`；看自检输出 |
+| Tab 提示“多行脚本，按 Alt+P” | 正常行为：Tab 菜单放不下多行，改用 `Alt+P` 整段插入 |
 | API 请求失败 | 自检会打印确切错误；检查 Key、Endpoint，以及**代理**（`HTTP_PROXY` 会影响请求） |
 | 行内灰字不出现 | 属正常现象，见[工作原理](#工作原理)，请用 Tab 或 Alt+P |
 | 改了 `AIPredictorSource.cs` 不生效 | 删除 `Modules/AIPredictor/bin` 后重开终端，会自动重新编译（缓存文件名带源码哈希） |
@@ -204,11 +208,12 @@ Test-AIPredictor
 | `v1.1.0` | AIPredictor 真正可用：改用引擎预测子系统（C#）+ `Alt+P`；API 修正为 OpenAI 兼容模式 |
 | `v1.2.0` | 新增 Tab 出 AI 建议（修掉“真实操作没反应”）、修掉 4 个启动报错、API 换成 DeepSeek、新增自检命令 |
 | `v1.3.0` | 移除会把终端进程杀掉的 `Microsoft.WinGet.CommandNotFound`；`Az.Tools.Predictor` 改为按需加载（启动 7.3 s → 1.1 s）；适配 PowerShell 7.6.7 |
+| `v1.4.0` | 只对自然语言发请求（不再被命令编辑触发，约省 79% 调用）；拒答/说明文字不再当命令；多行脚本安全处理；缓存 TTL；请求去重；英文自然语言支持；补 `.psd1` 清单（版本 1.4.0） |
 
 回退单个文件：
 
 ```powershell
-git checkout v1.3.0 -- Microsoft.PowerShell_profile.ps1
+git checkout v1.4.0 -- Microsoft.PowerShell_profile.ps1
 ```
 
 ---
